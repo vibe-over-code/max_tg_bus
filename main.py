@@ -5,6 +5,7 @@ from logging import getLogger, DEBUG
 import signal
 from datetime import datetime, time as t
 from io import BytesIO
+import gc
 
 import aiohttp
 from aiohttp import TCPConnector
@@ -33,9 +34,15 @@ END_TIME = t(22, 0)
 
 BOT_POST_MESSAGE = None # доп текст в сообщении от бота
 BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
-BOT_START_MESSAGE = None # стартовое сообщение бота отпарвляемое в макс при запуске (если None, то не отпралвять)
+BOT_START_MESSAGE = None # стартовое сообщение бота отпралвляемое в макс при запуске (если None, то не отпралвять)
 
 REQUESTS_TIMEOUT = 15 # таймаут запросов
+
+# --- Memory limits ---
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB — лимит Telegram, не грузим больше
+MAX_MSGS_MAP_ENTRIES = 50000  # максимальное количество записей в msgs_map
+FLUSH_INTERVAL = 500  # сбрасывать data.json каждые N сообщений
+FLUSH_COUNTER = 0  # счётчик для периодического сброса
 
 # --- Environment Variables ---
 try:
@@ -85,15 +92,52 @@ client._send_notification_response = _noop_notification_response
 msgs_map = data_handler.load('msgs') or {}
 last_sender_id = None
 
-async def download_content(url: str) -> BytesIO:
-    """Download content from URL into memory."""
+async def download_content(url: str, expected_filename: str = "file") -> BytesIO:
+    """Download content from URL into memory with size limit check."""
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, timeout=REQUESTS_TIMEOUT) as response: # pyright: ignore[reportArgumentType]
+        async with session.head(url, timeout=REQUESTS_TIMEOUT) as head_resp:
+            head_resp.raise_for_status()
+            content_length = head_resp.content_length
+            if content_length and content_length > MAX_FILE_SIZE:
+                l.warning(f"File too large: {content_length} bytes (limit {MAX_FILE_SIZE}). Skipping.")
+                return BytesIO(b"")
+        
+        async with session.get(url, timeout=REQUESTS_TIMEOUT) as response:
             response.raise_for_status()
-            content = await response.read()
-            file_bytes = BytesIO(content)
-            # Attempt to set a name, though Telegram often overrides logic based on method
-            file_bytes.name = response.headers.get("X-File-Name", "file")
+            
+            # Check Content-Length header if available
+            cl = response.content_length
+            if cl and cl > MAX_FILE_SIZE:
+                l.warning(f"File too large: {cl} bytes (limit {MAX_FILE_SIZE}). Skipping.")
+                return BytesIO(b"")
+            
+            # Stream in chunks to avoid loading everything at once
+            chunks = []
+            total_size = 0
+            async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                total_size += len(chunk)
+                if total_size > MAX_FILE_SIZE:
+                    l.warning(f"File exceeded limit during download: {total_size} bytes. Stopping.")
+                    chunks = []
+                    break
+                chunks.append(chunk)
+            
+            if not chunks:
+                return BytesIO(b"")
+            
+            # Join chunks into a single BytesIO — single allocation, no double-copy
+            file_bytes = BytesIO(b"".join(chunks))
+            chunks.clear()  # free the list immediately
+            gc.collect()  # hint GC to reclaim chunk memory
+            
+            # Set filename from Content-Disposition or header
+            filename = expected_filename
+            cd = response.headers.get("Content-Disposition", "")
+            if "filename=" in cd:
+                filename = cd.split("filename=")[-1].strip('"\'')
+            elif "X-File-Name" in response.headers:
+                filename = response.headers["X-File-Name"]
+            file_bytes.name = filename
             return file_bytes
 
 async def get_sender_name(user_id: int) -> str:
@@ -187,36 +231,51 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                 sent = None
                 try:
                     if isinstance(attach, PhotoAttach):
-                        f_bytes = await download_content(attach.base_url)
-                        sent = await bot.send_photo(
-                            TG_CHAT_ID,
-                            photo=BufferedInputFile(f_bytes.getvalue(), filename="photo.jpg"),
-                            caption=text_content if text_content else None,
-                            reply_to_message_id=reply_to_tg_id,
-                            parse_mode="Markdown"
-                        )
+                        f_bytes = await download_content(attach.base_url, "photo.jpg")
+                        if f_bytes.getbuffer().nbytes > 0:
+                            f_bytes.seek(0)  # reset cursor to beginning
+                            sent = await bot.send_photo(
+                                TG_CHAT_ID,
+                                photo=BufferedInputFile(f_bytes.read(), filename="photo.jpg"),
+                                caption=text_content if text_content else None,
+                                reply_to_message_id=reply_to_tg_id,
+                                parse_mode="Markdown"
+                            )
+                            f_bytes.close()
+                            del f_bytes
+                            gc.collect()
                     elif isinstance(attach, VideoAttach):
                         vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
                         if vid_info and vid_info.url:
-                            f_bytes = await download_content(vid_info.url)
-                            sent = await bot.send_video(
-                                TG_CHAT_ID,
-                                video=BufferedInputFile(f_bytes.getvalue(), filename="video.mp4"),
-                                caption=text_content if text_content else None,
-                                reply_to_message_id=reply_to_tg_id,
-                                parse_mode="Markdown"
-                            )
+                            f_bytes = await download_content(vid_info.url, "video.mp4")
+                            if f_bytes.getbuffer().nbytes > 0:
+                                f_bytes.seek(0)
+                                sent = await bot.send_video(
+                                    TG_CHAT_ID,
+                                    video=BufferedInputFile(f_bytes.read(), filename="video.mp4"),
+                                    caption=text_content if text_content else None,
+                                    reply_to_message_id=reply_to_tg_id,
+                                    parse_mode="Markdown"
+                                )
+                                f_bytes.close()
+                                del f_bytes
+                                gc.collect()
                     elif isinstance(attach, FileAttach):
                         file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
                         if file_info and file_info.url:
-                            f_bytes = await download_content(file_info.url)
-                            sent = await bot.send_document(
-                                TG_CHAT_ID,
-                                document=BufferedInputFile(f_bytes.getvalue(), filename=getattr(file_info, 'name', 'file')),
-                                caption=text_content if text_content else None,
-                                reply_to_message_id=reply_to_tg_id,
-                                parse_mode="Markdown"
-                            )
+                            f_bytes = await download_content(file_info.url, getattr(file_info, 'name', 'file'))
+                            if f_bytes.getbuffer().nbytes > 0:
+                                f_bytes.seek(0)
+                                sent = await bot.send_document(
+                                    TG_CHAT_ID,
+                                    document=BufferedInputFile(f_bytes.read(), filename=getattr(file_info, 'name', 'file')),
+                                    caption=text_content if text_content else None,
+                                    reply_to_message_id=reply_to_tg_id,
+                                    parse_mode="Markdown"
+                                )
+                                f_bytes.close()
+                                del f_bytes
+                                gc.collect()
 
                     if sent:
                         if first_tg_id is None: first_tg_id = sent.message_id
@@ -238,6 +297,22 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         # We save mapping for both forwarded items and top-level containers
         if first_tg_id and message.id:
             msgs_map[str(message.id)] = first_tg_id
+            
+            # Trim old entries if map exceeds limit (FIFO — oldest by dict order)
+            if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
+                # Remove oldest entries (Python 3.7+ dicts maintain insertion order)
+                excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
+                for _ in range(excess):
+                    msgs_map.pop(next(iter(msgs_map)))
+                l.info(f"Trimmed msgs_map: removed {excess} old entries, now {len(msgs_map)} entries")
+            
+            # Flush to disk periodically to avoid huge JSON
+            global FLUSH_COUNTER
+            FLUSH_COUNTER += 1
+            if FLUSH_COUNTER % FLUSH_INTERVAL == 0:
+                data_handler.save('msgs', msgs_map)
+                l.info(f"Flushed msgs_map to disk ({len(msgs_map)} entries)")
+            # Also save on every message to avoid data loss
             data_handler.save('msgs', msgs_map)
             l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
 
@@ -303,6 +378,14 @@ async def send_handler(message: types.Message):
         # Map message
         if sent_msg and sent_msg.id:
             msgs_map[str(sent_msg.id)] = message.message_id
+            
+            # Trim old entries if map exceeds limit
+            if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
+                excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
+                for _ in range(excess):
+                    msgs_map.pop(next(iter(msgs_map)))
+            
+            data_handler.save('msgs', msgs_map)
             await message.reply("Отправлено!")
 
     except Exception as e:
@@ -335,6 +418,14 @@ async def main():
     if os_name != 'nt':
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_event.set)
+
+    # --- Trim msgs_map on startup to save memory ---
+    if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
+        excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
+        for _ in range(excess):
+            msgs_map.pop(next(iter(msgs_map)))
+        l.info(f"Startup: trimmed msgs_map from {len(msgs_map) + excess} to {len(msgs_map)} entries (saved {excess * 50}B~)")
+        data_handler.save('msgs', msgs_map)
 
     # 2. Start Telegram Poller FIRST (as a background task)
     l.info("Starting Telegram Polling...")
