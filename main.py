@@ -21,6 +21,11 @@ from pymax.types import FileAttach, PhotoAttach, VideoAttach
 import data_handler
 from logger import setup_logger
 
+import os
+import uuid
+import aiofiles
+from aiogram.types import FSInputFile
+
 # --- Initial Setup ---
 setup_logger()
 l = getLogger()  # Use root logger with DEBUG level
@@ -99,6 +104,59 @@ def trim_msgs_map():
             msgs_map.pop(next(iter(msgs_map)))
         l.info(f"Trimmed msgs_map: removed {excess} old entries, now {len(msgs_map)} entries")
 
+
+async def download_to_disk(url: str, expected_filename: str = "file") -> str | None:
+    """Скачивает файл на диск чанками для экономии ОЗУ и возвращает путь к нему."""
+    # Убеждаемся, что папка cache существует
+    os.makedirs(os.path.join("data", "cache"), exist_ok=True)
+    
+    # Генерируем уникальное имя файла, чтобы избежать конфликтов при одновременной загрузке
+    temp_filename = f"temp_{uuid.uuid4().hex}_{expected_filename}"
+    filepath = os.path.join("data", "cache", temp_filename)
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.head(url, timeout=REQUESTS_TIMEOUT) as head_resp:
+                head_resp.raise_for_status()
+                content_length = head_resp.content_length
+                if content_length and content_length > MAX_FILE_SIZE:
+                    l.warning(f"File too large: {content_length} bytes (limit {MAX_FILE_SIZE}). Skipping.")
+                    return None
+            
+            async with session.get(url, timeout=REQUESTS_TIMEOUT) as response:
+                response.raise_for_status()
+                
+                cl = response.content_length
+                if cl and cl > MAX_FILE_SIZE:
+                    l.warning(f"File too large: {cl} bytes (limit {MAX_FILE_SIZE}). Skipping.")
+                    return None
+                
+                # Записываем чанки напрямую в файл
+                async with aiofiles.open(filepath, 'wb') as f:
+                    downloaded_size = 0
+                    exceeded_limit = False
+                    
+                    async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
+                        downloaded_size += len(chunk)
+                        if downloaded_size > MAX_FILE_SIZE:
+                            exceeded_limit = True
+                            break
+                        await f.write(chunk)
+                
+                # Если превысили лимит или файл оказался пустым - удаляем и отменяем отправку
+                if exceeded_limit or downloaded_size == 0:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    if exceeded_limit:
+                        l.warning("File exceeded limit during download. Stopping.")
+                    return None
+                    
+                return filepath
+    except Exception as e:
+        l.error(f"Error downloading file to disk: {e}")
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        return None
 
 async def download_content(url: str, expected_filename: str = "file") -> bytes | None:
     """Download content from URL into memory with size limit check."""
@@ -218,13 +276,14 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         if message.attaches:
             for attach in message.attaches:
                 sent = None
+                filepath = None
                 try:
                     if isinstance(attach, PhotoAttach):
-                        f_bytes = await download_content(attach.base_url, "photo.jpg")
-                        if f_bytes:
+                        filepath = await download_to_disk(attach.base_url, "photo.jpg")
+                        if filepath:
                             sent = await bot.send_photo(
                                 TG_CHAT_ID,
-                                photo=BufferedInputFile(f_bytes, filename="photo.jpg"),
+                                photo=FSInputFile(filepath, filename="photo.jpg"),
                                 caption=text_content if text_content else None,
                                 reply_to_message_id=reply_to_tg_id,
                                 parse_mode="Markdown"
@@ -232,11 +291,11 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                     elif isinstance(attach, VideoAttach):
                         vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
                         if vid_info and vid_info.url:
-                            f_bytes = await download_content(vid_info.url, "video.mp4")
-                            if f_bytes:
+                            filepath = await download_to_disk(vid_info.url, "video.mp4")
+                            if filepath:
                                 sent = await bot.send_video(
                                     TG_CHAT_ID,
-                                    video=BufferedInputFile(f_bytes, filename="video.mp4"),
+                                    video=FSInputFile(filepath, filename="video.mp4"),
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
@@ -245,11 +304,11 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                         file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
                         if file_info and file_info.url:
                             filename = getattr(file_info, 'name', 'file')
-                            f_bytes = await download_content(file_info.url, filename)
-                            if f_bytes:
+                            filepath = await download_to_disk(file_info.url, filename)
+                            if filepath:
                                 sent = await bot.send_document(
                                     TG_CHAT_ID,
-                                    document=BufferedInputFile(f_bytes, filename=filename),
+                                    document=FSInputFile(filepath, filename=filename),
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
@@ -257,9 +316,17 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
                     if sent:
                         if first_tg_id is None: first_tg_id = sent.message_id
-                        text_content = "" # Only send caption once
+                        text_content = "" # Отправляем текст только один раз
+                        
                 except Exception as e:
                     l.error(f"Attachment error: {e}")
+                finally:
+                    # Гарантированное удаление временного файла после отправки или при ошибке
+                    if filepath and os.path.exists(filepath):
+                        try:
+                            os.remove(filepath)
+                        except Exception as e:
+                            l.error(f"Failed to delete temp file {filepath}: {e}")
 
         # 7. Remaining Text
         if text_content.strip():
@@ -275,10 +342,8 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         if first_tg_id and message.id:
             msgs_map[str(message.id)] = first_tg_id
             
-            # Используем новую функцию
-            trim_msgs_map()
+            trim_msgs_map()  # Твоя функция очистки старых маппингов
             
-            # Убрано безусловное сохранение! Только периодическое.
             global FLUSH_COUNTER
             FLUSH_COUNTER += 1
             if FLUSH_COUNTER % FLUSH_INTERVAL == 0:

@@ -3,3 +3,4 @@ aiohttp
 maxapi-python==1.2.5
 python-dotenv
 requests
+aiofiles
