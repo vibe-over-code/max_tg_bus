@@ -46,7 +46,7 @@ try:
     TG_CHAT_ID = int(getenv('TG_CHAT_ID', 0))
     TG_TOKEN = getenv('TG_TOKEN')
     ADMIN_USER_ID = int(getenv('ADMIN_USER_ID', 0))
-    TG_PROXY = getenv('TG_PROXY', 'socks5://127.0.0.1:10808')  # proxy URL: http://user:pass@host:port or socks5://user:pass@host:port
+    TG_PROXY = getenv('TG_PROXY', '')  # proxy URL: http://user:pass@host:port or socks5://user:pass@host:port (optional)
     if not all([MAX_CHAT_ID, TG_CHAT_ID, TG_TOKEN, MAX_TOKEN, MAX_PHONE]):
         raise ValueError("One or more environment variables are not set.")
 
@@ -56,23 +56,22 @@ except (ValueError, TypeError) as e:
     l.critical(f"FATAL: Configuration error - {e}. Please check your .env file.")
     quit(1)
 
+# --- Create Bot with optional proxy ---
+if TG_PROXY:
+    l.info(f"Using Telegram proxy: {TG_PROXY}")
+    proxy_session = AiohttpSession(proxy=TG_PROXY)
+else:
+    l.info("No Telegram proxy configured, using direct connection")
+    proxy_session = AiohttpSession()
+bot = None  # Will be created in main()
+dp = Dispatcher()
+
 # --- Fix: Disable NOTIF_MESSAGE ack (opcode 128) ---
 # pymax's _send_notification_response sends an opcode 128 ack that the server rejects,
 # causing the WebSocket to disconnect. Override with a no-op.
 async def _noop_notification_response(chat_id: int, message_id: str) -> None:
     """No-op replacement for _send_notification_response to prevent server disconnect."""
     pass
-
-# --- Create Bot with optional proxy ---
-l.info(f"Telegram proxy: {TG_PROXY}")
-
-async def create_bot():
-    """Create bot with proxy session."""
-    session = AiohttpSession(proxy=TG_PROXY)
-    return Bot(token=TG_TOKEN, session=session)
-
-dp = Dispatcher()
-bot = None  # Will be created in main()
 
 # Reconnect=True effectively replaces the "Watchdog" thread
 if USE_SOCKET_CLIENT:
@@ -85,8 +84,6 @@ client._send_notification_response = _noop_notification_response
 
 msgs_map = data_handler.load('msgs') or {}
 last_sender_id = None
-
-# --- Helper Functions ---
 
 async def download_content(url: str) -> BytesIO:
     """Download content from URL into memory."""
@@ -329,8 +326,8 @@ async def on_startup():
 
 async def main():
     global bot
-    # Create bot with proxy session (needs event loop)
-    bot = await create_bot()
+    # Create bot with session (proxy or direct)
+    bot = Bot(token=TG_TOKEN, session=proxy_session)
     
     # 1. Setup Signal Handling
     stop_event = Event()
