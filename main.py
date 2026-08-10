@@ -91,8 +91,16 @@ client._send_notification_response = _noop_notification_response
 
 msgs_map = data_handler.load('msgs') or {}
 last_sender_id = None
+def trim_msgs_map():
+    """Удаляет старые записи из маппинга, если превышен лимит."""
+    if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
+        excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
+        for _ in range(excess):
+            msgs_map.pop(next(iter(msgs_map)))
+        l.info(f"Trimmed msgs_map: removed {excess} old entries, now {len(msgs_map)} entries")
 
-async def download_content(url: str, expected_filename: str = "file") -> BytesIO:
+
+async def download_content(url: str, expected_filename: str = "file") -> bytes | None:
     """Download content from URL into memory with size limit check."""
     async with aiohttp.ClientSession() as session:
         async with session.head(url, timeout=REQUESTS_TIMEOUT) as head_resp:
@@ -100,7 +108,7 @@ async def download_content(url: str, expected_filename: str = "file") -> BytesIO
             content_length = head_resp.content_length
             if content_length and content_length > MAX_FILE_SIZE:
                 l.warning(f"File too large: {content_length} bytes (limit {MAX_FILE_SIZE}). Skipping.")
-                return BytesIO(b"")
+                return None
         
         async with session.get(url, timeout=REQUESTS_TIMEOUT) as response:
             response.raise_for_status()
@@ -109,36 +117,20 @@ async def download_content(url: str, expected_filename: str = "file") -> BytesIO
             cl = response.content_length
             if cl and cl > MAX_FILE_SIZE:
                 l.warning(f"File too large: {cl} bytes (limit {MAX_FILE_SIZE}). Skipping.")
-                return BytesIO(b"")
+                return None
             
             # Stream in chunks to avoid loading everything at once
-            chunks = []
-            total_size = 0
+            chunks = bytearray()
             async for chunk in response.content.iter_chunked(1024 * 1024):  # 1MB chunks
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    l.warning(f"File exceeded limit during download: {total_size} bytes. Stopping.")
-                    chunks = []
-                    break
-                chunks.append(chunk)
+                chunks.extend(chunk)
+                if len(chunks) > MAX_FILE_SIZE:
+                    l.warning(f"File exceeded limit during download: {len(chunks)} bytes. Stopping.")
+                    return None
             
             if not chunks:
-                return BytesIO(b"")
+                return None
             
-            # Join chunks into a single BytesIO — single allocation, no double-copy
-            file_bytes = BytesIO(b"".join(chunks))
-            chunks.clear()  # free the list immediately
-            gc.collect()  # hint GC to reclaim chunk memory
-            
-            # Set filename from Content-Disposition or header
-            filename = expected_filename
-            cd = response.headers.get("Content-Disposition", "")
-            if "filename=" in cd:
-                filename = cd.split("filename=")[-1].strip('"\'')
-            elif "X-File-Name" in response.headers:
-                filename = response.headers["X-File-Name"]
-            file_bytes.name = filename
-            return file_bytes
+            return bytes(chunks)
 
 async def get_sender_name(user_id: int) -> str:
     """Fetch user name via PyMax."""
@@ -185,7 +177,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     msg_id_str = str(message.id) if message.id else "FWD_PART"
     l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded})")
 
-    # This will track the FIRST Telegram ID associated with this Max message
     first_tg_id = None
 
     try:
@@ -210,13 +201,11 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         fwds_to_process = []
         if message.link and message.link.type == 'FORWARD':
             fwds_to_process.append(message.link.message)
-        if hasattr(message, 'fwd_messages') and message.fwd_messages: # pyright: ignore[reportAttributeAccessIssue]
-            fwds_to_process.extend(message.fwd_messages) # pyright: ignore[reportAttributeAccessIssue]
+        if hasattr(message, 'fwd_messages') and message.fwd_messages: 
+            fwds_to_process.extend(message.fwd_messages) 
 
         for fwd_msg in fwds_to_process:
-            # Recursive call returns the TG ID of the forwarded message
             fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
-            # If our container doesn't have a TG ID yet (no header), use the first forward's ID
             if first_tg_id is None:
                 first_tg_id = fwd_tg_id
 
@@ -232,50 +221,39 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                 try:
                     if isinstance(attach, PhotoAttach):
                         f_bytes = await download_content(attach.base_url, "photo.jpg")
-                        if f_bytes.getbuffer().nbytes > 0:
-                            f_bytes.seek(0)  # reset cursor to beginning
+                        if f_bytes:
                             sent = await bot.send_photo(
                                 TG_CHAT_ID,
-                                photo=BufferedInputFile(f_bytes.read(), filename="photo.jpg"),
+                                photo=BufferedInputFile(f_bytes, filename="photo.jpg"),
                                 caption=text_content if text_content else None,
                                 reply_to_message_id=reply_to_tg_id,
                                 parse_mode="Markdown"
                             )
-                            f_bytes.close()
-                            del f_bytes
-                            gc.collect()
                     elif isinstance(attach, VideoAttach):
                         vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
                         if vid_info and vid_info.url:
                             f_bytes = await download_content(vid_info.url, "video.mp4")
-                            if f_bytes.getbuffer().nbytes > 0:
-                                f_bytes.seek(0)
+                            if f_bytes:
                                 sent = await bot.send_video(
                                     TG_CHAT_ID,
-                                    video=BufferedInputFile(f_bytes.read(), filename="video.mp4"),
+                                    video=BufferedInputFile(f_bytes, filename="video.mp4"),
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
                                 )
-                                f_bytes.close()
-                                del f_bytes
-                                gc.collect()
                     elif isinstance(attach, FileAttach):
                         file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
                         if file_info and file_info.url:
-                            f_bytes = await download_content(file_info.url, getattr(file_info, 'name', 'file'))
-                            if f_bytes.getbuffer().nbytes > 0:
-                                f_bytes.seek(0)
+                            filename = getattr(file_info, 'name', 'file')
+                            f_bytes = await download_content(file_info.url, filename)
+                            if f_bytes:
                                 sent = await bot.send_document(
                                     TG_CHAT_ID,
-                                    document=BufferedInputFile(f_bytes.read(), filename=getattr(file_info, 'name', 'file')),
+                                    document=BufferedInputFile(f_bytes, filename=filename),
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
                                 )
-                                f_bytes.close()
-                                del f_bytes
-                                gc.collect()
 
                     if sent:
                         if first_tg_id is None: first_tg_id = sent.message_id
@@ -294,27 +272,18 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             if first_tg_id is None: first_tg_id = sent_msg.message_id
 
         # 8. Save Mapping
-        # We save mapping for both forwarded items and top-level containers
         if first_tg_id and message.id:
             msgs_map[str(message.id)] = first_tg_id
             
-            # Trim old entries if map exceeds limit (FIFO — oldest by dict order)
-            if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
-                # Remove oldest entries (Python 3.7+ dicts maintain insertion order)
-                excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
-                for _ in range(excess):
-                    msgs_map.pop(next(iter(msgs_map)))
-                l.info(f"Trimmed msgs_map: removed {excess} old entries, now {len(msgs_map)} entries")
+            # Используем новую функцию
+            trim_msgs_map()
             
-            # Flush to disk periodically to avoid huge JSON
+            # Убрано безусловное сохранение! Только периодическое.
             global FLUSH_COUNTER
             FLUSH_COUNTER += 1
             if FLUSH_COUNTER % FLUSH_INTERVAL == 0:
                 data_handler.save('msgs', msgs_map)
                 l.info(f"Flushed msgs_map to disk ({len(msgs_map)} entries)")
-            # Also save on every message to avoid data loss
-            data_handler.save('msgs', msgs_map)
-            l.info(f"Mapping Saved: Max[{message.id}] == TG[{first_tg_id}]")
 
         return first_tg_id
 
@@ -379,11 +348,7 @@ async def send_handler(message: types.Message):
         if sent_msg and sent_msg.id:
             msgs_map[str(sent_msg.id)] = message.message_id
             
-            # Trim old entries if map exceeds limit
-            if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
-                excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
-                for _ in range(excess):
-                    msgs_map.pop(next(iter(msgs_map)))
+            trim_msgs_map()
             
             data_handler.save('msgs', msgs_map)
             await message.reply("Отправлено!")
@@ -420,12 +385,7 @@ async def main():
             loop.add_signal_handler(sig, stop_event.set)
 
     # --- Trim msgs_map on startup to save memory ---
-    if len(msgs_map) > MAX_MSGS_MAP_ENTRIES:
-        excess = len(msgs_map) - MAX_MSGS_MAP_ENTRIES
-        for _ in range(excess):
-            msgs_map.pop(next(iter(msgs_map)))
-        l.info(f"Startup: trimmed msgs_map from {len(msgs_map) + excess} to {len(msgs_map)} entries (saved {excess * 50}B~)")
-        data_handler.save('msgs', msgs_map)
+    trim_msgs_map()
 
     # 2. Start Telegram Poller FIRST (as a background task)
     l.info("Starting Telegram Polling...")
