@@ -285,14 +285,20 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     """
     Handles messages. Returns the Telegram Message ID of the first part sent.
     """
-    assert message.sender
-    assert message.chat_id
+    # Мягкая проверка вместо assert, чтобы бот не падал от системных сообщений
+    if not message.sender or not message.chat_id:
+        return None
+
+    # ДЕБАГ-ЛОГ: Выводим вообще все входящие, чтобы узнать реальный chat_id
+    text_preview = message.text[:30] + "..." if message.text else "<нет текста>"
+    l.info(f"📩 ВХОДЯЩЕЕ ИЗ MAX | chat_id: {message.chat_id} | sender: {message.sender} | текст: {text_preview}")
 
     # 1. Top-level filter — найти TG чат для этого MAX чата
     tg_info = get_tg_chat_for_max(message.chat_id)
     if tg_info is None:
-        return None  # Этот MAX чат не в маппинге
-        
+        l.warning(f"🚫 Игнор: MAX chat_id {message.chat_id} не найден в CHAT_MAPPING!")
+        return None 
+    
     tg_chat_id, thread_id = tg_info
 
     if message.text and message.text.startswith(BOT_MESSAGE_PREFIX):
@@ -305,7 +311,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
     try:
         sender_name, gender_suffix = await get_smart_sender_info(message.sender)
-
         # 2. Header Logic
         if not forwarded and get_last_sender_id(message.chat_id) != message.sender:
             header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
