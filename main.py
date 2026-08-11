@@ -56,40 +56,56 @@ try:
     MAX_TOKEN = getenv('VK_COOKIE')
     TG_TOKEN = getenv('TG_TOKEN')
     ADMIN_USER_ID = int(getenv('ADMIN_USER_ID', 0))
-    TG_PROXY = getenv('TG_PROXY', '')  # proxy URL: http://user:pass@host:port or socks5://user:pass@host:port (optional)
+    TG_PROXY = getenv('TG_PROXY', '') 
     if not all([TG_TOKEN, MAX_TOKEN, MAX_PHONE]):
         raise ValueError("One or more environment variables are not set.")
 
     assert TG_TOKEN
     assert MAX_PHONE
 
-    # Parse chat mapping: TG_ID:MAX_ID,TG_ID2:MAX_ID2
     mapping_str = getenv('CHAT_MAPPING', '')
     if not mapping_str.strip():
-        raise ValueError("CHAT_MAPPING is not set. Format: TG_ID:MAX_ID,TG_ID2:MAX_ID2")
+        raise ValueError("CHAT_MAPPING is not set. Format: TG_ID[/THREAD_ID]:MAX_ID,...")
 
-    tg_chat_ids = []
-    max_chat_ids = []
+    chat_pairs = []  
     for pair in mapping_str.split(','):
         pair = pair.strip()
         if not pair:
             continue
         parts = pair.split(':')
         if len(parts) != 2:
-            raise ValueError(f"Invalid CHAT_MAPPING pair: {pair}. Expected TG_ID:MAX_ID")
-        tg_id = int(parts[0].strip())
+            raise ValueError(f"Invalid CHAT_MAPPING pair: {pair}. Expected TG_ID[/THREAD_ID]:MAX_ID")
+        
+        tg_part = parts[0].strip()
         max_id = int(parts[1].strip())
-        tg_chat_ids.append(tg_id)
-        max_chat_ids.append(max_id)
+        
+        # Разбор топика, если он указан через слеш
+        if '/' in tg_part:
+            tg_id_str, thread_id_str = tg_part.split('/', 1)
+            tg_id = int(tg_id_str)
+            thread_id = int(thread_id_str)
+        else:
+            tg_id = int(tg_part)
+            thread_id = None
 
-    if not tg_chat_ids or not max_chat_ids:
+        chat_pairs.append((tg_id, thread_id, max_id))
+
+    if not chat_pairs:
         raise ValueError("CHAT_MAPPING produced no valid pairs.")
-    if len(tg_chat_ids) != len(max_chat_ids):
-        raise ValueError("CHAT_MAPPING has mismatched TG and MAX counts.")
 
-    l.info(f"Loaded {len(tg_chat_ids)} chat pair(s):")
-    for i in range(len(tg_chat_ids)):
-        l.info(f"  TG {tg_chat_ids[i]} <-> MAX {max_chat_ids[i]}")
+    tg_chat_ids = list(set(t[0] for t in chat_pairs))  
+    max_to_tg = {}  # max_id -> (tg_id, thread_id)
+    tg_to_max = {}  # (tg_id, thread_id) -> [max_id, ...]
+    
+    for tg_id, thread_id, max_id in chat_pairs:
+        max_to_tg[max_id] = (tg_id, thread_id)
+        tg_to_max.setdefault((tg_id, thread_id), []).append(max_id)
+
+    l.info(f"Loaded {len(chat_pairs)} chat pair(s) across {len(tg_chat_ids)} TG chat(s):")
+    for (tg_id, thread_id), max_list in tg_to_max.items():
+        max_list_str = ', '.join(str(m) for m in max_list)
+        thread_info = f" (Topic: {thread_id})" if thread_id else ""
+        l.info(f"  TG {tg_id}{thread_info} <- MAX [{max_list_str}]")
 
 except (ValueError, TypeError) as e:
     l.critical(f"FATAL: Configuration error - {e}. Please check your .env file.")
@@ -134,20 +150,15 @@ def clear_last_sender_id(max_id):
     last_sender_id.pop(max_id, None)
 
 def get_tg_chat_for_max(max_id):
-    """Найти TG чат для данного MAX чата."""
-    try:
-        idx = max_chat_ids.index(max_id)
-        return tg_chat_ids[idx]
-    except ValueError:
-        return None
+    """Найти TG чат и топик для данного MAX чата."""
+    return max_to_tg.get(max_id)
 
-def get_max_chat_for_tg(tg_id):
-    """Найти MAX чат для данного TG чата."""
-    try:
-        idx = tg_chat_ids.index(tg_id)
-        return max_chat_ids[idx]
-    except ValueError:
-        return None
+def get_max_chats_for_tg(tg_id, thread_id=None):
+    """Найти список MAX чатов для данного TG чата (и топика)."""
+    if (tg_id, thread_id) in tg_to_max:
+        return tg_to_max.get((tg_id, thread_id), [])
+    # Фолбэк на общий чат
+    return tg_to_max.get((tg_id, None), [])
 
 def trim_msgs_map():
     """Удаляет старые записи из маппинга, если превышен лимит."""
@@ -278,15 +289,17 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     assert message.chat_id
 
     # 1. Top-level filter — найти TG чат для этого MAX чата
-    tg_chat_id = get_tg_chat_for_max(message.chat_id)
-    if tg_chat_id is None:
+    tg_info = get_tg_chat_for_max(message.chat_id)
+    if tg_info is None:
         return None  # Этот MAX чат не в маппинге
+        
+    tg_chat_id, thread_id = tg_info
 
     if message.text and message.text.startswith(BOT_MESSAGE_PREFIX):
         return None
 
     msg_id_str = str(message.id) if message.id else "FWD_PART"
-    l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded}, TG: {tg_chat_id})")
+    l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded}, TG: {tg_chat_id}, Topic: {thread_id})")
 
     first_tg_id = None
 
@@ -296,7 +309,12 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         # 2. Header Logic
         if not forwarded and get_last_sender_id(message.chat_id) != message.sender:
             header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
-            sent_header = await bot.send_message(tg_chat_id, header_text, parse_mode="Markdown")
+            sent_header = await bot.send_message(
+                tg_chat_id, 
+                text=header_text, 
+                message_thread_id=thread_id,
+                parse_mode="Markdown"
+            )
             first_tg_id = sent_header.message_id
             set_last_sender_id(message.chat_id, message.sender)
 
@@ -304,7 +322,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         reply_to_tg_id = None
         if message.link and message.link.type == 'REPLY':
             replied_max_id = str(message.link.message.id)
-            # Ищем ключ с префиксом max_chat_id
             prefix = f"{message.chat_id}:"
             for mid, tid in msgs_map.items():
                 if mid == f"{prefix}{replied_max_id}":
@@ -342,6 +359,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                             sent = await bot.send_photo(
                                 tg_chat_id,
                                 photo=FSInputFile(filepath, filename="photo.jpg"),
+                                message_thread_id=thread_id,
                                 caption=text_content if text_content else None,
                                 reply_to_message_id=reply_to_tg_id,
                                 parse_mode="Markdown"
@@ -354,6 +372,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                 sent = await bot.send_video(
                                     tg_chat_id,
                                     video=FSInputFile(filepath, filename="video.mp4"),
+                                    message_thread_id=thread_id,
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
@@ -367,6 +386,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                 sent = await bot.send_document(
                                     tg_chat_id,
                                     document=FSInputFile(filepath, filename=filename),
+                                    message_thread_id=thread_id,
                                     caption=text_content if text_content else None,
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
@@ -374,12 +394,11 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
                     if sent:
                         if first_tg_id is None: first_tg_id = sent.message_id
-                        text_content = "" # Отправляем текст только один раз
+                        text_content = "" 
                         
                 except Exception as e:
                     l.error(f"Attachment error: {e}")
                 finally:
-                    # Гарантированное удаление временного файла после отправки или при ошибке
                     if filepath and os.path.exists(filepath):
                         try:
                             os.remove(filepath)
@@ -390,18 +409,19 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         if text_content.strip():
             sent_msg = await bot.send_message(
                 tg_chat_id,
-                text_content,
+                text=text_content,
+                message_thread_id=thread_id,
                 reply_to_message_id=reply_to_tg_id,
                 parse_mode="Markdown"
             )
             if first_tg_id is None: first_tg_id = sent_msg.message_id
 
-        # 8. Save Mapping — с префиксом max_id для уникальности
+        # 8. Save Mapping
         if first_tg_id and message.id:
             key = f"{message.chat_id}:{message.id}"
             msgs_map[key] = first_tg_id
             
-            trim_msgs_map()  # Твоя функция очистки старых маппингов
+            trim_msgs_map() 
             
             global FLUSH_COUNTER
             FLUSH_COUNTER += 1
@@ -414,11 +434,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     except Exception as e:
         l.error(f"Error: {e}", exc_info=True)
         return None
-
-@client.on_message()
-async def max_message_handler(message: Message):
-    """PyMax entry point — returns coroutine so pymax can wrap it in a safe task."""
-    return await process_max_message(message)
 
 # --- Logic: Telegram -> Max ---
 
@@ -443,11 +458,14 @@ async def send_handler(message: types.Message):
             await message.reply("Нельзя отправить пустое сообщение.")
             return
 
-        # Найти MAX чат для этого TG чата
-        max_chat_id = get_max_chat_for_tg(message.chat_id)
-        if max_chat_id is None:
-            await message.reply("Этот TG чат не привязан к никакому MAX чату.")
+        # Найти MAX чат для этого TG чата и топика
+        thread_id = message.message_thread_id
+        max_chats = get_max_chats_for_tg(message.chat.id, thread_id)
+        
+        if not max_chats:
+            await message.reply("Этот TG чат (или тема) не привязан к никакому MAX чату.")
             return
+        max_chat_id = max_chats[0]
 
         # Get username
         username = message.from_user.full_name or message.from_user.username
@@ -461,7 +479,6 @@ async def send_handler(message: types.Message):
         reply_to_max_id = None
         if message.reply_to_message:
             tg_reply_id = message.reply_to_message.message_id
-            # Reverse lookup — ищем по префиксу max_chat_id
             prefix = f"{max_chat_id}:"
             for mid, tid in msgs_map.items():
                 if mid.startswith(prefix) and tid == tg_reply_id:
@@ -475,7 +492,7 @@ async def send_handler(message: types.Message):
             reply_to=reply_to_max_id
         )
 
-        # Map message — с префиксом max_chat_id
+        # Map message
         if sent_msg and sent_msg.id:
             key = f"{max_chat_id}:{sent_msg.id}"
             msgs_map[key] = message.message_id
@@ -496,16 +513,19 @@ async def on_startup():
 
     # Send startup message (invite link) logic
     if BOT_START_MESSAGE and not data_handler.load("started"):
-        for i, tg_id in enumerate(tg_chat_ids):
-            max_id = max_chat_ids[i]
+        unique_tg_chats = set(t[0] for t in chat_pairs)
+        for tg_id in unique_tg_chats:
             try:
                 invite = await bot.create_chat_invite_link(tg_id)
                 msg = BOT_START_MESSAGE.replace("TG_CHAT_INVITE_LINK", invite.invite_link)
-                await client.send_message(msg, max_id)
+                # Берем все max_id привязанные к этому tg_id
+                max_ids = [t[2] for t in chat_pairs if t[0] == tg_id]
+                for max_id in max_ids:
+                    await client.send_message(msg, max_id)
                 data_handler.save("started", True)
-                l.info(f"Startup message sent to TG {tg_id} <-> MAX {max_id}")
+                l.info(f"Startup message sent for TG {tg_id}")
             except Exception as e:
-                l.error(f"Failed to send startup message for TG {tg_id} <-> MAX {max_id}: {e}")
+                l.error(f"Failed to send startup message for TG {tg_id}: {e}")
 
 async def main():
     global bot
