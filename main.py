@@ -285,15 +285,15 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     """
     Handles messages. Returns the Telegram Message ID of the first part sent.
     """
-    # Мягкая проверка вместо assert, чтобы бот не падал от системных сообщений
-    if not message.sender or not message.chat_id:
-        return None
-
-    # ДЕБАГ-ЛОГ: Выводим вообще все входящие, чтобы узнать реальный chat_id
+    # 1. СНАЧАЛА ЛОГИРУЕМ ВСЁ! (до любых проверок)
     text_preview = message.text[:30] + "..." if message.text else "<нет текста>"
     l.info(f"📩 ВХОДЯЩЕЕ ИЗ MAX | chat_id: {message.chat_id} | sender: {message.sender} | текст: {text_preview}")
 
-    # 1. Top-level filter — найти TG чат для этого MAX чата
+    # Проверяем только наличие chat_id (так как в каналах sender может отсутствовать)
+    if not message.chat_id:
+        return None
+
+    # 2. Ищем TG чат для этого MAX чата
     tg_info = get_tg_chat_for_max(message.chat_id)
     if tg_info is None:
         l.warning(f"🚫 Игнор: MAX chat_id {message.chat_id} не найден в CHAT_MAPPING!")
@@ -310,10 +310,20 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     first_tg_id = None
 
     try:
-        sender_name, gender_suffix = await get_smart_sender_info(message.sender)
-        # 2. Header Logic
+        # 3. ЛОГИКА ДЛЯ КАНАЛОВ (где нет конкретного отправителя)
+        if message.sender:
+            sender_name, gender_suffix = await get_smart_sender_info(message.sender)
+        else:
+            # Заглушка, если это публикация в канале от имени сообщества
+            sender_name, gender_suffix = "Канал", ""
+
+        # 4. Header Logic
         if not forwarded and get_last_sender_id(message.chat_id) != message.sender:
-            header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
+            if message.sender:
+                header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
+            else:
+                header_text = f"{BOT_MESSAGE_PREFIX} *Новое сообщение из канала:*"
+
             sent_header = await bot.send_message(
                 tg_chat_id, 
                 text=header_text, 
@@ -323,7 +333,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             first_tg_id = sent_header.message_id
             set_last_sender_id(message.chat_id, message.sender)
 
-        # 3. Reply Mapping (Lookup)
+        # 5. Reply Mapping (Lookup)
         reply_to_tg_id = None
         if message.link and message.link.type == 'REPLY':
             replied_max_id = str(message.link.message.id)
@@ -335,7 +345,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             if reply_to_tg_id:
                 l.info(f"Reply Link: Max[{replied_max_id}] -> TG[{reply_to_tg_id}]")
 
-        # 4. Forward Recursion
+        # 6. Forward Recursion
         fwds_to_process = []
         if message.link and message.link.type == 'FORWARD':
             fwds_to_process.append(message.link.message)
@@ -347,12 +357,12 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             if first_tg_id is None:
                 first_tg_id = fwd_tg_id
 
-        # 5. Content Prep
+        # 7. Content Prep
         text_content = message.text or ""
         if forwarded:
             text_content = f"↪ Переслано от {sender_name}:_\n{text_content}"
 
-        # 6. Attachments
+        # 8. Attachments
         if message.attaches:
             for attach in message.attaches:
                 sent = None
@@ -410,7 +420,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                         except Exception as e:
                             l.error(f"Failed to delete temp file {filepath}: {e}")
 
-        # 7. Remaining Text
+        # 9. Remaining Text
         if text_content.strip():
             sent_msg = await bot.send_message(
                 tg_chat_id,
@@ -421,7 +431,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             )
             if first_tg_id is None: first_tg_id = sent_msg.message_id
 
-        # 8. Save Mapping
+        # 10. Save Mapping
         if first_tg_id and message.id:
             key = f"{message.chat_id}:{message.id}"
             msgs_map[key] = first_tg_id
@@ -437,7 +447,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         return first_tg_id
 
     except Exception as e:
-        l.error(f"Error: {e}", exc_info=True)
+        l.error(f"Error in process_max_message: {e}", exc_info=True)
         return None
 
 # --- Logic: Telegram -> Max ---
