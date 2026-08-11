@@ -442,6 +442,29 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
 # --- Logic: Telegram -> Max ---
 
+@client.on_message()
+async def max_message_handler(*args, **kwargs):
+    """Максимально всеядная функция, чтобы точно поймать любое срабатывание"""
+    l.info(f"🚨 СРАБОТАЛ on_message! Сырые данные: args={args}, kwargs={kwargs}")
+    
+    try:
+        # Пытаемся достать объект message из переданных аргументов
+        message = None
+        if args and hasattr(args[0], 'chat_id'):
+            message = args[0]
+        elif len(args) > 1 and hasattr(args[1], 'chat_id'):
+            message = args[1]
+        elif 'message' in kwargs:
+            message = kwargs['message']
+            
+        if not message:
+            l.warning(f"⚠️ Событие пришло, но объект message не распознан. Доступные атрибуты первого аргумента: {dir(args[0]) if args else 'нет'}")
+            return
+            
+        return await process_max_message(message)
+    except Exception as e:
+        l.error(f"❌ Ошибка внутри max_message_handler: {e}", exc_info=True)
+
 @dp.message(Command("send"))
 async def send_handler(message: types.Message):
     """Handles /send command."""
