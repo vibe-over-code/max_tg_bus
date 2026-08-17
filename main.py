@@ -45,6 +45,10 @@ REQUESTS_TIMEOUT = 15 # таймаут запросов
 
 # --- Memory limits ---
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB — лимит Telegram, не грузим больше
+TG_TEXT_LIMIT = 4096
+TG_CAPTION_LIMIT = 1024
+TG_SEND_RETRIES = 4
+TG_SEND_CONCURRENCY = 2
 MAX_MSGS_MAP_ENTRIES = 50000  # максимальное количество записей в msgs_map
 FLUSH_INTERVAL = 500  # сбрасывать data.json каждые N сообщений
 FLUSH_COUNTER = 0  # счётчик для периодического сброса
@@ -120,6 +124,7 @@ else:
     proxy_session = AiohttpSession()
 bot = None  # Will be created in main()
 dp = Dispatcher()
+tg_send_semaphore = asyncio.Semaphore(TG_SEND_CONCURRENCY)
 
 # --- Fix: Disable NOTIF_MESSAGE ack (opcode 128) ---
 # pymax's _send_notification_response sends an opcode 128 ack that the server rejects,
@@ -180,13 +185,6 @@ async def download_to_disk(url: str, expected_filename: str = "file") -> str | N
     
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.head(url, timeout=REQUESTS_TIMEOUT) as head_resp:
-                head_resp.raise_for_status()
-                content_length = head_resp.content_length
-                if content_length and content_length > MAX_FILE_SIZE:
-                    l.warning(f"File too large: {content_length} bytes (limit {MAX_FILE_SIZE}). Skipping.")
-                    return None
-            
             async with session.get(url, timeout=REQUESTS_TIMEOUT) as response:
                 response.raise_for_status()
                 
@@ -221,6 +219,29 @@ async def download_to_disk(url: str, expected_filename: str = "file") -> str | N
         if os.path.exists(filepath):
             os.remove(filepath)
         return None
+
+def split_text(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
+    """Split long Telegram messages without losing characters."""
+    return [text[i:i + limit] for i in range(0, len(text), limit)] or []
+
+
+async def send_to_tg(operation, description: str):
+    """Retry temporary Telegram failures instead of dropping the message."""
+    for attempt in range(1, TG_SEND_RETRIES + 1):
+        try:
+            async with tg_send_semaphore:
+                return await operation()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            if attempt == TG_SEND_RETRIES:
+                l.error(f"Telegram delivery failed ({description}) after {attempt} attempts: {e}")
+                return None
+            retry_after = getattr(e, "retry_after", None)
+            delay = float(retry_after) if retry_after else min(2 ** (attempt - 1), 8)
+            l.warning(f"Telegram delivery failed ({description}), retry {attempt}/{TG_SEND_RETRIES} in {delay:.0f}s: {e}")
+            await asyncio.sleep(delay)
+
 
 async def download_content(url: str, expected_filename: str = "file") -> bytes | None:
     """Download content from URL into memory with size limit check."""
@@ -312,7 +333,18 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     try:
         # 3. ЛОГИКА ДЛЯ КАНАЛОВ (где нет конкретного отправителя)
         if message.sender:
-            sender_name, gender_suffix = await get_smart_sender_info(message.sender)
+            try:
+                # Ставим жесткий таймаут 3 секунды, чтобы бот не зависал!
+                sender_name, gender_suffix = await asyncio.wait_for(
+                    get_smart_sender_info(message.sender),
+                    timeout=3.0
+                )
+            except asyncio.TimeoutError:
+                l.warning(f"⚠️ MAX API завис при получении юзера {message.sender}! Ставим заглушку.")
+                sender_name, gender_suffix = "Неизвестный", ""
+            except Exception as e:
+                l.error(f"❌ Ошибка при получении юзера: {e}")
+                sender_name, gender_suffix = "Ошибка", ""
         else:
             # Заглушка, если это публикация в канале от имени сообщества
             sender_name, gender_suffix = "Канал", ""
@@ -320,18 +352,17 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         # 4. Header Logic
         if not forwarded and get_last_sender_id(message.chat_id) != message.sender:
             if message.sender:
-                header_text = f"{BOT_MESSAGE_PREFIX} *{sender_name} написа{gender_suffix}:*"
+                header_text = f"{BOT_MESSAGE_PREFIX} {sender_name} написа{gender_suffix}:"
             else:
-                header_text = f"{BOT_MESSAGE_PREFIX} *Новое сообщение из канала:*"
+                header_text = f"{BOT_MESSAGE_PREFIX} Новое сообщение из канала:"
 
-            sent_header = await bot.send_message(
-                tg_chat_id, 
-                text=header_text, 
-                message_thread_id=thread_id,
-                parse_mode="Markdown"
+            sent_header = await send_to_tg(
+                lambda: bot.send_message(tg_chat_id, text=header_text, message_thread_id=thread_id),
+                "header",
             )
-            first_tg_id = sent_header.message_id
-            set_last_sender_id(message.chat_id, message.sender)
+            if sent_header:
+                first_tg_id = sent_header.message_id
+                set_last_sender_id(message.chat_id, message.sender)
 
         # 5. Reply Mapping (Lookup)
         reply_to_tg_id = None
@@ -353,6 +384,9 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             fwds_to_process.extend(message.fwd_messages) 
 
         for fwd_msg in fwds_to_process:
+            if not getattr(fwd_msg, 'chat_id', None):
+                fwd_msg.chat_id = message.chat_id
+
             fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
             if first_tg_id is None:
                 first_tg_id = fwd_tg_id
@@ -360,10 +394,10 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         # 7. Content Prep
         text_content = message.text or ""
         if forwarded:
-            text_content = f"↪ Переслано от {sender_name}:_\n{text_content}"
+            text_content = f"↪ Переслано от {sender_name}:\n{text_content}"
 
         # 8. Attachments
-        if message.attaches:
+        if getattr(message, 'attaches', None):
             for attach in message.attaches:
                 sent = None
                 filepath = None
@@ -371,14 +405,25 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                     if isinstance(attach, PhotoAttach):
                         filepath = await download_to_disk(attach.base_url, "photo.jpg")
                         if filepath:
-                            sent = await bot.send_photo(
-                                tg_chat_id,
-                                photo=FSInputFile(filepath, filename="photo.jpg"),
-                                message_thread_id=thread_id,
-                                caption=text_content if text_content else None,
-                                reply_to_message_id=reply_to_tg_id,
-                                parse_mode="Markdown"
+                            sent = await send_to_tg(
+                                lambda: bot.send_photo(
+                                    tg_chat_id,
+                                    photo=FSInputFile(filepath, filename="photo.jpg"),
+                                    message_thread_id=thread_id,
+                                    reply_to_message_id=reply_to_tg_id,
+                                ),
+                                "photo",
                             )
+                            if not sent:
+                                sent = await send_to_tg(
+                                    lambda: bot.send_document(
+                                        tg_chat_id,
+                                        document=FSInputFile(filepath, filename="photo.jpg"),
+                                        message_thread_id=thread_id,
+                                        reply_to_message_id=reply_to_tg_id,
+                                    ),
+                                    "photo fallback document",
+                                )
                     elif isinstance(attach, VideoAttach):
                         vid_info = await client.get_video_by_id(message.chat_id, message.id, attach.video_id)
                         if vid_info and vid_info.url:
@@ -409,7 +454,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
                     if sent:
                         if first_tg_id is None: first_tg_id = sent.message_id
-                        text_content = "" 
+                        # Text is sent separately: captions have a 1024-character limit.
                         
                 except Exception as e:
                     l.error(f"Attachment error: {e}")
@@ -422,14 +467,18 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
         # 9. Remaining Text
         if text_content.strip():
-            sent_msg = await bot.send_message(
-                tg_chat_id,
-                text=text_content,
-                message_thread_id=thread_id,
-                reply_to_message_id=reply_to_tg_id,
-                parse_mode="Markdown"
-            )
-            if first_tg_id is None: first_tg_id = sent_msg.message_id
+            for chunk in split_text(text_content):
+                sent_msg = await send_to_tg(
+                    lambda chunk=chunk: bot.send_message(
+                        tg_chat_id,
+                        text=chunk,
+                        message_thread_id=thread_id,
+                        reply_to_message_id=reply_to_tg_id,
+                    ),
+                    "text",
+                )
+                if sent_msg and first_tg_id is None:
+                    first_tg_id = sent_msg.message_id
 
         # 10. Save Mapping
         if first_tg_id and message.id:
@@ -580,23 +629,6 @@ async def main():
     # --- Trim msgs_map on startup to save memory ---
     trim_msgs_map()
 
-    # 2. Start Telegram Poller FIRST (as a background task)
-    l.info("Starting Telegram Polling...")
-    # This creates the task but doesn't block execution
-    tg_task = create_task(dp.start_polling(bot))
-
-    # Add error logging to tg_task
-    def _log_tg_error(t):
-        if t.cancelled():
-            l.info("tg_task: cancelled")
-            return
-        exc = t.exception()
-        if exc:
-            l.error(f"Telegram polling crashed: {exc}", exc_info=exc)
-        else:
-            l.info("tg_task: completed normally")
-
-    tg_task.add_done_callback(_log_tg_error)
 
     # 3. Run startup logic (invite links, etc.)
     l.info("Running on_startup()...")
@@ -619,6 +651,18 @@ async def main():
             l.info("max_task: completed normally")
 
     max_task.add_done_callback(_log_max_error)
+
+
+    def _log_tg_error(t):
+        if t.cancelled():
+            l.info("tg_task: cancelled")
+            return
+        exc = t.exception()
+        if exc:
+            l.error(f"Telegram polling crashed: {exc}", exc_info=exc)
+        else:
+            l.info("tg_task: completed normally")
+
 
     # Helper to safely start polling
     async def safe_polling():

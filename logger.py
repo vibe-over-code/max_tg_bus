@@ -1,4 +1,5 @@
 import logging
+import os
 from logging.handlers import RotatingFileHandler
 from sys import stdout
 
@@ -37,6 +38,7 @@ class ConsoleFormatterWithNoTraceback(logging.Formatter):
 def setup_logger():
     log_file = 'data/bot.log'
     api_log_file = 'data/api_responses.log'
+    os.makedirs('data', exist_ok=True)
 
     try:
         open(log_file, 'x').close()
