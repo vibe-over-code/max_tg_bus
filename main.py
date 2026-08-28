@@ -194,7 +194,7 @@ async def run_server_command(*args: str) -> tuple[int, str]:
         process = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.STDOUT,
+            stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
         return process.returncode or 0, stdout.decode('utf-8', errors='replace').strip()
