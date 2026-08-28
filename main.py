@@ -1,7 +1,10 @@
 from os import name as os_name, getenv
 import asyncio
+import logging
 from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop
-from logging import getLogger, DEBUG
+from logging import getLogger, DEBUG, Handler
+from time import monotonic
+from contextlib import suppress
 import signal
 from datetime import datetime, time as t
 from io import BytesIO
@@ -13,7 +16,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 from pymax import SocketMaxClient, MaxClient, Message
 from pymax.types import FileAttach, PhotoAttach, VideoAttach
@@ -125,6 +128,8 @@ else:
 bot = None  # Will be created in main()
 dp = Dispatcher()
 tg_send_semaphore = asyncio.Semaphore(TG_SEND_CONCURRENCY)
+restart_event = asyncio.Event()
+_last_max_error_notification = 0.0
 
 # --- Fix: Disable NOTIF_MESSAGE ack (opcode 128) ---
 # pymax's _send_notification_response sends an opcode 128 ack that the server rejects,
@@ -141,6 +146,66 @@ else:
 
 # Disable the buggy NOTIF_MESSAGE ack that disconnects the server
 client._send_notification_response = _noop_notification_response
+
+
+async def notify_max_error(text: str) -> None:
+    """Send a MAX connection error to the administrator with a restart button."""
+    if not bot or not ADMIN_USER_ID:
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Перезапустить MAX", callback_data="max_restart")
+    ]])
+    try:
+        await bot.send_message(
+            ADMIN_USER_ID,
+            "⚠️ Ошибка соединения MAX\n\n"
+            f"{text[:3000]}\n\n"
+            "Можно перезапустить клиент кнопкой ниже.",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        # Do not log through pymax.core here: that could create a notification loop.
+        l.error(f"Could not send MAX error notification to Telegram: {e}")
+
+
+class MaxErrorTelegramHandler(Handler):
+    """Forward pymax.core errors to Telegram, with a short anti-spam window."""
+
+    def emit(self, record):
+        global _last_max_error_notification
+        if record.name != "pymax.core" or record.levelno < 40:
+            return
+
+        now = monotonic()
+        if now - _last_max_error_notification < 60:
+            return
+        _last_max_error_notification = now
+
+        message = self.format(record)
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(notify_max_error(message))
+        except RuntimeError:
+            pass
+
+
+max_error_handler = MaxErrorTelegramHandler()
+max_error_handler.setLevel(40)
+max_error_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+l.addHandler(max_error_handler)
+
+
+@dp.callback_query(lambda query: query.data == "max_restart")
+async def restart_max_callback(query: CallbackQuery):
+    if not query.from_user or query.from_user.id != ADMIN_USER_ID:
+        await query.answer("Недостаточно прав", show_alert=True)
+        return
+
+    restart_event.set()
+    await query.answer("Перезапуск MAX запрошен")
+    if query.message:
+        await query.message.edit_reply_markup(reply_markup=None)
 
 msgs_map = data_handler.load('msgs') or {}
 last_sender_id = {}  # {max_chat_id: sender_id}
@@ -685,17 +750,16 @@ async def main():
     l.info("All tasks created, entering main loop...")
 
     try:
-        # We use a task for Max as well to allow clean shutdowns
-        # Wait for either the stop signal or the tasks to fail
-        # Only react to stop_task or max_task completion, ignore tg_task crashes
+        # We use tasks for shutdown and manual MAX restart requests.
         stop_task = create_task(stop_event.wait())
+        restart_task = create_task(restart_event.wait())
         loop_count = 0
         while not stop_event.is_set():
             loop_count += 1
             if loop_count % 10 == 0:
                 l.info(f"Main loop running... (stop_event={stop_event.is_set()}, tg_task.done()={tg_task.done()}, max_task.done()={max_task.done()}, stop_task.done()={stop_task.done()})")
             done, pending = await wait(
-                [tg_task, max_task, stop_task],
+                [tg_task, max_task, stop_task, restart_task],
                 return_when=FIRST_COMPLETED
             )
             
@@ -703,6 +767,18 @@ async def main():
                 if task == stop_task:
                     l.info("Stop signal received")
                     return
+                elif task == restart_task:
+                    l.warning("MAX restart requested from Telegram")
+                    restart_event.clear()
+                    restart_task = create_task(restart_event.wait())
+                    max_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await max_task
+                    with suppress(Exception):
+                        await client.close()
+                    max_task = create_task(client.start())
+                    max_task.add_done_callback(_log_max_error)
+                    l.info("MAX client restarted from Telegram")
                 elif task == max_task:
                     if task.cancelled() or task.exception() is not None:
                         l.error("Max client crashed, restarting...")
@@ -732,6 +808,7 @@ async def main():
         # Clean up tasks
         tg_task.cancel()
         max_task.cancel()
+        restart_task.cancel()
 
         await client.close()
         if bot:
