@@ -1,6 +1,7 @@
 from os import name as os_name, getenv
 import asyncio
 import logging
+import re
 from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop
 from logging import getLogger, DEBUG, Handler
 from time import monotonic
@@ -63,6 +64,10 @@ try:
     MAX_TOKEN = getenv('VK_COOKIE')
     TG_TOKEN = getenv('TG_TOKEN')
     ADMIN_USER_ID = int(getenv('ADMIN_USER_ID', 0))
+    SERVICE_NAME = getenv('SERVICE_NAME', 'max-bot').strip()
+    LOG_LINES = min(max(int(getenv('LOG_LINES', '40')), 10), 100)
+    if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', SERVICE_NAME):
+        raise ValueError('SERVICE_NAME contains invalid characters')
     TG_PROXY = getenv('TG_PROXY', '') 
     if not all([TG_TOKEN, MAX_TOKEN, MAX_PHONE]):
         raise ValueError("One or more environment variables are not set.")
@@ -167,6 +172,94 @@ async def notify_max_error(text: str) -> None:
     except Exception as e:
         # Do not log through pymax.core here: that could create a notification loop.
         l.error(f"Could not send MAX error notification to Telegram: {e}")
+
+
+def server_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📊 Статус", callback_data="server_status"),
+            InlineKeyboardButton(text="📜 Логи", callback_data="server_logs"),
+        ],
+        [
+            InlineKeyboardButton(text="❗ Ошибки", callback_data="server_errors"),
+            InlineKeyboardButton(text="🔄 Перезапустить сервис", callback_data="server_restart"),
+        ],
+        [InlineKeyboardButton(text="♻️ Перезапустить MAX", callback_data="max_restart")],
+    ])
+
+
+async def run_server_command(*args: str) -> tuple[int, str]:
+    """Run a fixed systemd/journalctl command and return its output."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=15)
+        return process.returncode or 0, stdout.decode('utf-8', errors='replace').strip()
+    except asyncio.TimeoutError:
+        return 124, 'Команда превысила таймаут 15 секунд.'
+    except Exception as e:
+        return 1, f'{type(e).__name__}: {e}'
+
+
+async def server_info(mode: str) -> str:
+    if mode == 'status':
+        code, output = await run_server_command(
+            'systemctl', 'status', SERVICE_NAME, '--no-pager', '--full'
+        )
+    elif mode == 'errors':
+        code, output = await run_server_command(
+            'journalctl', '-u', SERVICE_NAME, '-p', 'err', '-n', str(LOG_LINES), '--no-pager'
+        )
+    else:
+        code, output = await run_server_command(
+            'journalctl', '-u', SERVICE_NAME, '-n', str(LOG_LINES), '--no-pager'
+        )
+
+    title = {'status': 'Статус', 'logs': 'Последние логи', 'errors': 'Ошибки'}[mode]
+    result = output or '(вывод пуст)'
+    if len(result) > 3800:
+        result = result[-3800:]
+    return f"🖥 {title}: {SERVICE_NAME}\n\n{result}\n\nКод завершения: {code}"
+
+
+def is_admin_user(user) -> bool:
+    return bool(user and ADMIN_USER_ID and user.id == ADMIN_USER_ID)
+
+
+@dp.message(Command("server"))
+async def server_panel_handler(message: types.Message):
+    if not is_admin_user(message.from_user):
+        return
+    await message.answer(
+        f"🖥 Панель сервера: {SERVICE_NAME}\nВыбери действие:",
+        reply_markup=server_keyboard(),
+    )
+
+
+@dp.callback_query(lambda query: query.data in {
+    'server_status', 'server_logs', 'server_errors', 'server_restart'
+})
+async def server_callback(query: CallbackQuery):
+    if not is_admin_user(query.from_user):
+        await query.answer('Недостаточно прав', show_alert=True)
+        return
+
+    action = query.data.removeprefix('server_')
+    await query.answer('Выполняю...')
+    if action == 'restart':
+        code, output = await run_server_command('systemctl', 'restart', SERVICE_NAME)
+        text = (
+            f"🔄 Перезапуск {SERVICE_NAME}: "
+            f"{'успешно' if code == 0 else 'ошибка'}\n\n{output or 'Команда выполнена.'}"
+        )
+    else:
+        text = await server_info(action)
+
+    if query.message:
+        await query.message.edit_text(text[:4096], reply_markup=server_keyboard())
 
 
 class MaxErrorTelegramHandler(Handler):
