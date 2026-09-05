@@ -19,8 +19,21 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
-from pymax import SocketMaxClient, MaxClient, Message
-from pymax.types import FileAttach, PhotoAttach, VideoAttach
+import pymax
+
+# PyMax 2.x replaced SocketMaxClient/MaxClient with Client/WebClient.
+# Keep the fallback so an existing 1.x deployment can still be started.
+try:
+    from pymax import Client as SocketMaxClient, Message, ExtraConfig
+    from pymax.types import FileAttachment as FileAttach
+    from pymax.types import PhotoAttachment as PhotoAttach
+    from pymax.types import VideoAttachment as VideoAttach
+    MODERN_PYMAX = True
+except ImportError:
+    from pymax import SocketMaxClient, MaxClient, Message
+    from pymax.types import FileAttach, PhotoAttach, VideoAttach
+    ExtraConfig = None
+    MODERN_PYMAX = False
 
 import data_handler
 from logger import setup_logger
@@ -69,8 +82,10 @@ try:
     if not re.fullmatch(r'[A-Za-z0-9_.@:-]+', SERVICE_NAME):
         raise ValueError('SERVICE_NAME contains invalid characters')
     TG_PROXY = getenv('TG_PROXY', '') 
-    if not all([TG_TOKEN, MAX_TOKEN, MAX_PHONE]):
-        raise ValueError("One or more environment variables are not set.")
+    # PyMax 2.x stores the MAX token in data/cache/session.db.
+    # VK_COOKIE remains supported for an existing 1.x installation.
+    if not all([TG_TOKEN, MAX_PHONE]):
+        raise ValueError("TG_TOKEN or VK_PHONE is not set.")
 
     assert TG_TOKEN
     assert MAX_PHONE
@@ -144,7 +159,17 @@ async def _noop_notification_response(chat_id: int, message_id: str) -> None:
     pass
 
 # Reconnect=True effectively replaces the "Watchdog" thread
-if USE_SOCKET_CLIENT:
+if MODERN_PYMAX:
+    client = SocketMaxClient(
+        phone=MAX_PHONE,
+        work_dir="data/cache",
+        extra_config=ExtraConfig(
+            token=MAX_TOKEN or None,
+            reconnect=True,
+            relogin=True,
+        ),
+    )
+elif USE_SOCKET_CLIENT:
     client = SocketMaxClient(MAX_PHONE, token=MAX_TOKEN, work_dir="data/cache", reconnect=True)
 else:
     client = MaxClient(MAX_PHONE, token=MAX_TOKEN, work_dir="data/cache", reconnect=True)
