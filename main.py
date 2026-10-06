@@ -57,6 +57,7 @@ END_TIME = t(22, 0)
 BOT_POST_MESSAGE = None # доп текст в сообщении от бота
 BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
 BOT_START_MESSAGE = None # стартовое сообщение бота отпралвляемое в макс при запуске (если None, то не отпралвять)
+DONATE_MESSAGE = getenv('DONATE_MESSAGE') or None # запрос на донаты, добавляется в конец каждого сообщения бота (None — выключено)
 
 REQUESTS_TIMEOUT = 15 # таймаут запросов
 
@@ -408,6 +409,15 @@ def split_text(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)] or []
 
 
+def append_donate(text: str) -> str:
+    """Append the donation note to the end of a bot message."""
+    if not DONATE_MESSAGE:
+        return text
+    if not text:
+        return DONATE_MESSAGE
+    return f"{text}\n\n{DONATE_MESSAGE}"
+
+
 async def send_to_tg(operation, description: str):
     """Retry temporary Telegram failures instead of dropping the message."""
     for attempt in range(1, TG_SEND_RETRIES + 1):
@@ -579,6 +589,11 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
         if forwarded:
             text_content = f"↪ Переслано от {sender_name}:\n{text_content}"
 
+        # Для медиа без текста подписью будет запрос на донаты
+        media_only_caption = None
+        if not text_content.strip():
+            media_only_caption = append_donate("") or None
+
         # 8. Attachments
         if getattr(message, 'attaches', None):
             for attach in message.attaches:
@@ -592,6 +607,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                 lambda: bot.send_photo(
                                     tg_chat_id,
                                     photo=FSInputFile(filepath, filename="photo.jpg"),
+                                    caption=media_only_caption,
                                     message_thread_id=thread_id,
                                     reply_to_message_id=reply_to_tg_id,
                                 ),
@@ -602,6 +618,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     lambda: bot.send_document(
                                         tg_chat_id,
                                         document=FSInputFile(filepath, filename="photo.jpg"),
+                                        caption=media_only_caption,
                                         message_thread_id=thread_id,
                                         reply_to_message_id=reply_to_tg_id,
                                     ),
@@ -616,7 +633,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     tg_chat_id,
                                     video=FSInputFile(filepath, filename="video.mp4"),
                                     message_thread_id=thread_id,
-                                    caption=text_content if text_content else None,
+                                    caption=(text_content if text_content else media_only_caption),
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
                                 )
@@ -630,7 +647,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     tg_chat_id,
                                     document=FSInputFile(filepath, filename=filename),
                                     message_thread_id=thread_id,
-                                    caption=text_content if text_content else None,
+                                    caption=(text_content if text_content else media_only_caption),
                                     reply_to_message_id=reply_to_tg_id,
                                     parse_mode="Markdown"
                                 )
@@ -650,7 +667,13 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
         # 9. Remaining Text
         if text_content.strip():
-            for chunk in split_text(text_content):
+            donate_suffix = f"\n\n{DONATE_MESSAGE}" if DONATE_MESSAGE else ""
+            # Оставляем место под запрос на донаты в последнем чанке
+            chunk_limit = max(TG_TEXT_LIMIT - len(donate_suffix), 1)
+            chunks = split_text(text_content, chunk_limit)
+            for index, chunk in enumerate(chunks):
+                if index == len(chunks) - 1:
+                    chunk += donate_suffix
                 sent_msg = await send_to_tg(
                     lambda chunk=chunk: bot.send_message(
                         tg_chat_id,
@@ -744,6 +767,8 @@ async def send_handler(message: types.Message):
         full_text = f"{BOT_MESSAGE_PREFIX} *{username} написал(-а):*\n{text_to_send}"
         if BOT_POST_MESSAGE:
             full_text += f"\n{BOT_MESSAGE_PREFIX} {BOT_POST_MESSAGE}"
+        if DONATE_MESSAGE:
+            full_text += f"\n\n{DONATE_MESSAGE}"
 
         # Get id of replied message in MAX
         reply_to_max_id = None
