@@ -508,24 +508,6 @@ async def send_report_to_tg(chat_id, thread_id=None) -> bool:
         return False
 
 
-async def send_report_to_max(tg_chat_id, max_chat_id) -> bool:
-    if not report_due(tg_chat_id):
-        return False
-    async with _donate_lock:
-        if not report_due(tg_chat_id):
-            return False
-        text = f"{DONATE_MESSAGE}\n\n{donation_report_text()}" if DONATE_MESSAGE else donation_report_text()
-        try:
-            sent = await client.send_message(chat_id=max_chat_id, text=text)
-        except Exception as e:
-            l.error(f"MAX donation progress report failed: {e}")
-            return False
-        if sent:
-            mark_report_sent(tg_chat_id)
-            return True
-        return False
-
-
 async def poll_donationalerts() -> None:
     """Collect confirmed DonationAlerts donations without sending per-donation messages."""
     if not DONATIONALERTS_TOKEN:
@@ -961,7 +943,6 @@ async def send_handler(message: types.Message):
             trim_msgs_map()
             
             data_handler.save('msgs', msgs_map)
-            await send_report_to_max(message.chat.id, max_chat_id)
             await message.reply("Отправлено!")
 
     except Exception as e:
