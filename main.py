@@ -4,10 +4,11 @@ import logging
 import re
 from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop
 from logging import getLogger, DEBUG, Handler
-from time import monotonic
+from time import monotonic, time as epoch_time
 from contextlib import suppress
 import signal
-from datetime import datetime, time as t
+from datetime import datetime, time as t, timezone, timedelta
+from zoneinfo import ZoneInfo
 from io import BytesIO
 import gc
 
@@ -57,7 +58,20 @@ END_TIME = t(22, 0)
 BOT_POST_MESSAGE = None # доп текст в сообщении от бота
 BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
 BOT_START_MESSAGE = None # стартовое сообщение бота отпралвляемое в макс при запуске (если None, то не отпралвять)
-DONATE_MESSAGE = getenv('DONATE_MESSAGE') or None # запрос на донаты, добавляется в конец каждого сообщения бота (None — выключено)
+DONATE_MESSAGE = getenv('DONATE_MESSAGE') or None # важная информация перед еженедельным отчётом (опционально)
+REPORT_INTERVAL = float(getenv('DONATION_REPORT_INTERVAL_SECONDS', 7 * 24 * 60 * 60)) # недельный отчёт
+DONATIONALERTS_TOKEN = getenv('DONATIONALERTS_ACCESS_TOKEN') or None
+DONATIONALERTS_API_URL = 'https://www.donationalerts.com/api/v1/alerts/donations'
+DONATIONALERTS_POLL_SECONDS = max(float(getenv('DONATIONALERTS_POLL_SECONDS', '60')), 30.0)
+DONATION_CURRENCY = (getenv('DONATION_CURRENCY', 'RUB') or 'RUB').upper()
+SERVER_GOAL = float(getenv('SERVER_GOAL', '0'))
+COOKIES_GOAL = float(getenv('COOKIES_GOAL', '0'))
+DONATE_URL = getenv('DONATE_URL') or 'https://www.donationalerts.com/r/'
+try:
+    REPORT_TIMEZONE = ZoneInfo(getenv('REPORT_TIMEZONE', 'Asia/Yekaterinburg'))
+except Exception:
+    # Windows installations may not have the IANA timezone database installed.
+    REPORT_TIMEZONE = timezone(timedelta(hours=5))
 
 REQUESTS_TIMEOUT = 15 # таймаут запросов
 
@@ -409,13 +423,25 @@ def split_text(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)] or []
 
 
-def append_donate(text: str) -> str:
-    """Append the donation note to the end of a bot message."""
-    if not DONATE_MESSAGE:
-        return text
-    if not text:
-        return DONATE_MESSAGE
-    return f"{text}\n\n{DONATE_MESSAGE}"
+_report_last_sent = {
+    str(chat_id): float(timestamp)
+    for chat_id, timestamp in (data_handler.load('report_last_sent') or {}).items()
+}
+_donate_lock = asyncio.Lock()
+_donation_state = data_handler.load('donation_state') or {}
+
+
+def report_due(chat_id) -> bool:
+    """Return whether this chat is due its weekly progress report."""
+    if not DONATIONALERTS_TOKEN or SERVER_GOAL <= 0 or COOKIES_GOAL <= 0:
+        return False
+    last_sent = _report_last_sent.get(str(chat_id))
+    return last_sent is None or epoch_time() - last_sent >= REPORT_INTERVAL
+
+
+def mark_report_sent(chat_id) -> None:
+    _report_last_sent[str(chat_id)] = epoch_time()
+    data_handler.save('report_last_sent', _report_last_sent)
 
 
 async def send_to_tg(operation, description: str):
@@ -434,6 +460,152 @@ async def send_to_tg(operation, description: str):
             delay = float(retry_after) if retry_after else min(2 ** (attempt - 1), 8)
             l.warning(f"Telegram delivery failed ({description}), retry {attempt}/{TG_SEND_RETRIES} in {delay:.0f}s: {e}")
             await asyncio.sleep(delay)
+
+
+def donation_month() -> str:
+    return datetime.now(REPORT_TIMEZONE).strftime('%Y-%m')
+
+
+def progress_bar(value: float, goal: float, width: int = 10) -> str:
+    ratio = min(max(value / goal if goal else 0, 0), 1)
+    filled = round(ratio * width)
+    return '█' * filled + '░' * (width - filled)
+
+
+def donation_report_text() -> str:
+    total = float(_donation_state.get('amount', 0.0))
+    server_amount = min(total, SERVER_GOAL)
+    cookies_amount = min(max(total - SERVER_GOAL, 0.0), COOKIES_GOAL)
+    return (
+        f"ℹ️ Поддержать проект: {DONATE_URL}\n\n"
+        f"Сервер  {progress_bar(server_amount, SERVER_GOAL)} "
+        f"{server_amount:.0f}/{SERVER_GOAL:.0f} {DONATION_CURRENCY}\n"
+        f"Печеньки {progress_bar(cookies_amount, COOKIES_GOAL)} "
+        f"{cookies_amount:.0f}/{COOKIES_GOAL:.0f} {DONATION_CURRENCY}"
+    )
+
+
+async def send_report_to_tg(chat_id, thread_id=None) -> bool:
+    if not report_due(chat_id):
+        return False
+
+    async with _donate_lock:
+        if not report_due(chat_id):
+            return False
+        text = f"{DONATE_MESSAGE}\n\n{donation_report_text()}" if DONATE_MESSAGE else donation_report_text()
+        sent = await send_to_tg(
+            lambda: bot.send_message(
+                chat_id,
+                text=text,
+                message_thread_id=thread_id,
+                disable_notification=True,
+            ),
+            "weekly donation progress report",
+        )
+        if sent:
+            mark_report_sent(chat_id)
+            return True
+        return False
+
+
+async def send_report_to_max(tg_chat_id, max_chat_id) -> bool:
+    if not report_due(tg_chat_id):
+        return False
+    async with _donate_lock:
+        if not report_due(tg_chat_id):
+            return False
+        text = f"{DONATE_MESSAGE}\n\n{donation_report_text()}" if DONATE_MESSAGE else donation_report_text()
+        try:
+            sent = await client.send_message(chat_id=max_chat_id, text=text)
+        except Exception as e:
+            l.error(f"MAX donation progress report failed: {e}")
+            return False
+        if sent:
+            mark_report_sent(tg_chat_id)
+            return True
+        return False
+
+
+async def poll_donationalerts() -> None:
+    """Collect confirmed DonationAlerts donations without sending per-donation messages."""
+    if not DONATIONALERTS_TOKEN:
+        l.info("DonationAlerts is disabled: DONATIONALERTS_ACCESS_TOKEN is not set")
+        return
+
+    headers = {"Authorization": f"Bearer {DONATIONALERTS_TOKEN}"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while True:
+            try:
+                current_month = donation_month()
+                if _donation_state.get('month') != current_month:
+                    _donation_state.clear()
+                    _donation_state.update({
+                        'month': current_month,
+                        'amount': 0.0,
+                        'seen_ids': [],
+                    })
+                    data_handler.save('donation_state', _donation_state)
+                    l.info(f"Donation progress reset for {current_month}")
+
+                seen_ids = {str(item) for item in _donation_state.get('seen_ids', [])}
+                page = 1
+                added = 0
+                while page <= 20:
+                    async with session.get(
+                        DONATIONALERTS_API_URL,
+                        params={'page': page},
+                        timeout=REQUESTS_TIMEOUT,
+                    ) as response:
+                        response.raise_for_status()
+                        payload = await response.json()
+
+                    donations = payload.get('data', [])
+                    if not donations:
+                        break
+
+                    for donation in donations:
+                        donation_id = str(donation.get('id', ''))
+                        if not donation_id or donation_id in seen_ids:
+                            continue
+                        seen_ids.add(donation_id)
+
+                        if str(donation.get('created_at', ''))[:7] != current_month:
+                            continue
+                        if str(donation.get('currency', '')).upper() != DONATION_CURRENCY:
+                            l.warning(
+                                "Skipping DonationAlerts donation %s: currency %s, expected %s",
+                                donation_id,
+                                donation.get('currency'),
+                                DONATION_CURRENCY,
+                            )
+                            continue
+
+                        amount = float(donation.get('amount', 0) or 0)
+                        if amount > 0:
+                            _donation_state['amount'] = float(_donation_state.get('amount', 0)) + amount
+                            added += 1
+
+                    links = payload.get('links') or {}
+                    if not links.get('next'):
+                        break
+                    page += 1
+
+                _donation_state['seen_ids'] = list(seen_ids)[-10000:]
+                if added:
+                    data_handler.save('donation_state', _donation_state)
+                    l.info(
+                        "Donation progress updated: +%s %s, total=%s %s",
+                        added,
+                        DONATION_CURRENCY,
+                        _donation_state['amount'],
+                        DONATION_CURRENCY,
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                l.error(f"DonationAlerts polling failed: {e}")
+
+            await asyncio.sleep(DONATIONALERTS_POLL_SECONDS)
 
 
 async def download_content(url: str, expected_filename: str = "file") -> bytes | None:
@@ -522,6 +694,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
     l.info(f"Processing Max Message ID: {msg_id_str} (Forwarded: {forwarded}, TG: {tg_chat_id}, Topic: {thread_id})")
 
     first_tg_id = None
+    main_content_sent = False
 
     try:
         # 3. ЛОГИКА ДЛЯ КАНАЛОВ (где нет конкретного отправителя)
@@ -583,17 +756,15 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             fwd_tg_id = await process_max_message(fwd_msg, forwarded=True)
             if first_tg_id is None:
                 first_tg_id = fwd_tg_id
+            if fwd_tg_id:
+                main_content_sent = True
 
         # 7. Content Prep
         text_content = message.text or ""
         if forwarded:
             text_content = f"↪ Переслано от {sender_name}:\n{text_content}"
 
-        # Для медиа без текста подписью будет запрос на донаты
-        media_only_caption = None
-        if not text_content.strip():
-            media_only_caption = append_donate("") or None
-
+        # Donation/info is sent separately after the main content succeeds.
         # 8. Attachments
         if getattr(message, 'attaches', None):
             for attach in message.attaches:
@@ -607,7 +778,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                 lambda: bot.send_photo(
                                     tg_chat_id,
                                     photo=FSInputFile(filepath, filename="photo.jpg"),
-                                    caption=media_only_caption,
                                     message_thread_id=thread_id,
                                     reply_to_message_id=reply_to_tg_id,
                                 ),
@@ -618,7 +788,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     lambda: bot.send_document(
                                         tg_chat_id,
                                         document=FSInputFile(filepath, filename="photo.jpg"),
-                                        caption=media_only_caption,
                                         message_thread_id=thread_id,
                                         reply_to_message_id=reply_to_tg_id,
                                     ),
@@ -633,9 +802,8 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     tg_chat_id,
                                     video=FSInputFile(filepath, filename="video.mp4"),
                                     message_thread_id=thread_id,
-                                    caption=(text_content if text_content else media_only_caption),
+                                    caption=text_content or None,
                                     reply_to_message_id=reply_to_tg_id,
-                                    parse_mode="Markdown"
                                 )
                     elif isinstance(attach, FileAttach):
                         file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
@@ -647,12 +815,12 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                                     tg_chat_id,
                                     document=FSInputFile(filepath, filename=filename),
                                     message_thread_id=thread_id,
-                                    caption=(text_content if text_content else media_only_caption),
+                                    caption=text_content or None,
                                     reply_to_message_id=reply_to_tg_id,
-                                    parse_mode="Markdown"
                                 )
 
                     if sent:
+                        main_content_sent = True
                         if first_tg_id is None: first_tg_id = sent.message_id
                         # Text is sent separately: captions have a 1024-character limit.
                         
@@ -667,13 +835,8 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
 
         # 9. Remaining Text
         if text_content.strip():
-            donate_suffix = f"\n\n{DONATE_MESSAGE}" if DONATE_MESSAGE else ""
-            # Оставляем место под запрос на донаты в последнем чанке
-            chunk_limit = max(TG_TEXT_LIMIT - len(donate_suffix), 1)
-            chunks = split_text(text_content, chunk_limit)
-            for index, chunk in enumerate(chunks):
-                if index == len(chunks) - 1:
-                    chunk += donate_suffix
+            chunks = split_text(text_content, TG_TEXT_LIMIT)
+            for chunk in chunks:
                 sent_msg = await send_to_tg(
                     lambda chunk=chunk: bot.send_message(
                         tg_chat_id,
@@ -685,8 +848,14 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                 )
                 if sent_msg and first_tg_id is None:
                     first_tg_id = sent_msg.message_id
+                if sent_msg:
+                    main_content_sent = True
 
-        # 10. Save Mapping
+        # 10. Send donation/info separately, only after the main message succeeded.
+        if main_content_sent:
+            await send_report_to_tg(tg_chat_id, thread_id)
+
+        # 11. Save Mapping
         if first_tg_id and message.id:
             key = f"{message.chat_id}:{message.id}"
             msgs_map[key] = first_tg_id
@@ -767,9 +936,6 @@ async def send_handler(message: types.Message):
         full_text = f"{BOT_MESSAGE_PREFIX} *{username} написал(-а):*\n{text_to_send}"
         if BOT_POST_MESSAGE:
             full_text += f"\n{BOT_MESSAGE_PREFIX} {BOT_POST_MESSAGE}"
-        if DONATE_MESSAGE:
-            full_text += f"\n\n{DONATE_MESSAGE}"
-
         # Get id of replied message in MAX
         reply_to_max_id = None
         if message.reply_to_message:
@@ -795,6 +961,7 @@ async def send_handler(message: types.Message):
             trim_msgs_map()
             
             data_handler.save('msgs', msgs_map)
+            await send_report_to_max(message.chat.id, max_chat_id)
             await message.reply("Отправлено!")
 
     except Exception as e:
@@ -890,6 +1057,16 @@ async def main():
     tg_task = create_task(safe_polling())
     tg_task.add_done_callback(_log_tg_error)
 
+    donation_task = None
+    if DONATIONALERTS_TOKEN:
+        donation_task = create_task(poll_donationalerts())
+
+        def _log_donation_error(t):
+            if not t.cancelled() and t.exception():
+                l.error(f"DonationAlerts polling crashed: {t.exception()}", exc_info=t.exception())
+
+        donation_task.add_done_callback(_log_donation_error)
+
     l.info("All tasks created, entering main loop...")
 
     try:
@@ -901,8 +1078,11 @@ async def main():
             loop_count += 1
             if loop_count % 10 == 0:
                 l.info(f"Main loop running... (stop_event={stop_event.is_set()}, tg_task.done()={tg_task.done()}, max_task.done()={max_task.done()}, stop_task.done()={stop_task.done()})")
+            wait_tasks = [tg_task, max_task, stop_task, restart_task]
+            if donation_task:
+                wait_tasks.append(donation_task)
             done, pending = await wait(
-                [tg_task, max_task, stop_task, restart_task],
+                wait_tasks,
                 return_when=FIRST_COMPLETED
             )
             
@@ -940,6 +1120,10 @@ async def main():
                     else:
                         l.info("Telegram polling exited normally")
                         return
+                elif task == donation_task:
+                    l.error("DonationAlerts polling stopped")
+                    donation_task = create_task(poll_donationalerts())
+                    donation_task.add_done_callback(_log_donation_error)
 
     except Exception as e:
         l.error(f"Critical error in main loop: {e}", exc_info=True)
@@ -952,6 +1136,8 @@ async def main():
         tg_task.cancel()
         max_task.cancel()
         restart_task.cancel()
+        if donation_task:
+            donation_task.cancel()
 
         await client.close()
         if bot:
