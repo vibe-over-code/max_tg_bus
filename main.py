@@ -478,9 +478,9 @@ def donation_report_text() -> str:
     cookies_amount = min(max(total - SERVER_GOAL, 0.0), COOKIES_GOAL)
     return (
         f"ℹ️ Поддержать проект: {DONATE_URL}\n\n"
-        f"Сервер  {progress_bar(server_amount, SERVER_GOAL)} "
+        f"На сервер  {progress_bar(server_amount, SERVER_GOAL)} "
         f"{server_amount:.0f}/{SERVER_GOAL:.0f} {DONATION_CURRENCY}\n"
-        f"Печеньки {progress_bar(cookies_amount, COOKIES_GOAL)} "
+        f"На печеньки {progress_bar(cookies_amount, COOKIES_GOAL)} "
         f"{cookies_amount:.0f}/{COOKIES_GOAL:.0f} {DONATION_CURRENCY}"
     )
 
