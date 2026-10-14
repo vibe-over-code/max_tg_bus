@@ -58,14 +58,9 @@ END_TIME = t(22, 0)
 BOT_POST_MESSAGE = None # доп текст в сообщении от бота
 BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
 BOT_START_MESSAGE = None # стартовое сообщение бота отпралвляемое в макс при запуске (если None, то не отпралвять)
-DONATE_MESSAGE = getenv('DONATE_MESSAGE') or None # важная информация перед еженедельным отчётом (опционально)
-REPORT_INTERVAL = float(getenv('DONATION_REPORT_INTERVAL_SECONDS', 7 * 24 * 60 * 60)) # недельный отчёт
-DONATIONALERTS_TOKEN = getenv('DONATIONALERTS_ACCESS_TOKEN') or None
-DONATIONALERTS_API_URL = 'https://www.donationalerts.com/api/v1/alerts/donations'
-DONATIONALERTS_POLL_SECONDS = max(float(getenv('DONATIONALERTS_POLL_SECONDS', '60')), 30.0)
-DONATION_CURRENCY = (getenv('DONATION_CURRENCY', 'RUB') or 'RUB').upper()
-SERVER_GOAL = float(getenv('SERVER_GOAL', '0'))
-COOKIES_GOAL = float(getenv('COOKIES_GOAL', '0'))
+DONATE_MESSAGE = getenv('DONATE_MESSAGE') or 'Поддержать проект донатом:'
+DONATE_REMINDER_DAYS = {1, 15}
+DONATIONALERTS_TOKEN = None  # DonationAlerts отключён
 DONATE_URL = getenv('DONATE_URL') or 'https://www.donationalerts.com/r/'
 try:
     REPORT_TIMEZONE = ZoneInfo(getenv('REPORT_TIMEZONE', 'Asia/Yekaterinburg'))
@@ -431,16 +426,22 @@ _donate_lock = asyncio.Lock()
 _donation_state = data_handler.load('donation_state') or {}
 
 
+def reminder_slot() -> str | None:
+    """Return the current twice-monthly reminder slot, if today is a reminder day."""
+    now = datetime.now(REPORT_TIMEZONE)
+    if now.day not in DONATE_REMINDER_DAYS:
+        return None
+    return now.strftime('%Y-%m-%d')
+
+
 def report_due(chat_id) -> bool:
-    """Return whether this chat is due its weekly progress report."""
-    if not DONATIONALERTS_TOKEN or SERVER_GOAL <= 0 or COOKIES_GOAL <= 0:
-        return False
-    last_sent = _report_last_sent.get(str(chat_id))
-    return last_sent is None or epoch_time() - last_sent >= REPORT_INTERVAL
+    """Return whether this chat has not received today's text reminder."""
+    slot = reminder_slot()
+    return slot is not None and _report_last_sent.get(str(chat_id)) != slot
 
 
 def mark_report_sent(chat_id) -> None:
-    _report_last_sent[str(chat_id)] = epoch_time()
+    _report_last_sent[str(chat_id)] = reminder_slot()
     data_handler.save('report_last_sent', _report_last_sent)
 
 
@@ -485,6 +486,11 @@ def donation_report_text() -> str:
     )
 
 
+# DonationAlerts integration is intentionally disabled. The reminder is plain text only.
+def donation_report_text() -> str:
+    return f"{DONATE_MESSAGE}\n{DONATE_URL}"
+
+
 async def send_report_to_tg(chat_id, thread_id=None) -> bool:
     if not report_due(chat_id):
         return False
@@ -492,7 +498,7 @@ async def send_report_to_tg(chat_id, thread_id=None) -> bool:
     async with _donate_lock:
         if not report_due(chat_id):
             return False
-        text = f"{DONATE_MESSAGE}\n\n{donation_report_text()}" if DONATE_MESSAGE else donation_report_text()
+        text = donation_report_text()
         sent = await send_to_tg(
             lambda: bot.send_message(
                 chat_id,
@@ -500,7 +506,7 @@ async def send_report_to_tg(chat_id, thread_id=None) -> bool:
                 message_thread_id=thread_id,
                 disable_notification=True,
             ),
-            "weekly donation progress report",
+            "twice-monthly donation reminder",
         )
         if sent:
             mark_report_sent(chat_id)
@@ -833,11 +839,7 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                 if sent_msg:
                     main_content_sent = True
 
-        # 10. Send donation/info separately, only after the main message succeeded.
-        if main_content_sent:
-            await send_report_to_tg(tg_chat_id, thread_id)
-
-        # 11. Save Mapping
+        # 10. Save Mapping
         if first_tg_id and message.id:
             key = f"{message.chat_id}:{message.id}"
             msgs_map[key] = first_tg_id
