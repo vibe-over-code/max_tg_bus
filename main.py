@@ -2,6 +2,8 @@ from os import name as os_name, getenv
 import asyncio
 import logging
 import re
+import mimetypes
+from urllib.parse import urlparse
 from asyncio import run, wait, create_task, FIRST_COMPLETED, Event, get_running_loop
 from logging import getLogger, DEBUG, Handler
 from time import monotonic, time as epoch_time
@@ -59,7 +61,7 @@ BOT_POST_MESSAGE = None # доп текст в сообщении от бота
 BOT_MESSAGE_PREFIX = "⫻" # префикс для отпарвляемых сообщений
 BOT_START_MESSAGE = None # стартовое сообщение бота отпралвляемое в макс при запуске (если None, то не отпралвять)
 DONATE_MESSAGE = getenv('DONATE_MESSAGE') or 'Поддержать проект донатом:'
-DONATE_REMINDER_DAYS = {1, 15}
+DONATE_REMINDER_DAYS = {1}
 DONATIONALERTS_TOKEN = None  # DonationAlerts отключён
 DONATE_URL = getenv('DONATE_URL') or 'https://www.donationalerts.com/r/'
 try:
@@ -220,6 +222,7 @@ def server_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔄 Перезапустить сервис", callback_data="server_restart"),
         ],
         [InlineKeyboardButton(text="♻️ Перезапустить MAX", callback_data="max_restart")],
+        [InlineKeyboardButton(text="📣 Отправить напоминание о донате во все чаты", callback_data="donation_send_all")],
     ])
 
 
@@ -295,6 +298,18 @@ async def server_callback(query: CallbackQuery):
 
     if query.message:
         await query.message.edit_text(text[:4096], reply_markup=server_keyboard())
+
+
+@dp.callback_query(lambda query: query.data == 'donation_send_all')
+async def donation_send_all_callback(query: CallbackQuery):
+    if not is_admin_user(query.from_user):
+        await query.answer('Недостаточно прав', show_alert=True)
+        return
+
+    await query.answer('Отправляю во все чаты...')
+    sent, total = await send_donation_to_all()
+    if query.message:
+        await query.message.answer(f'Напоминание о донате отправлено: {sent}/{total} чатов.')
 
 
 class MaxErrorTelegramHandler(Handler):
@@ -380,6 +395,15 @@ async def download_to_disk(url: str, expected_filename: str = "file") -> str | N
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=REQUESTS_TIMEOUT) as response:
                 response.raise_for_status()
+
+                filename = os.path.basename(expected_filename.strip()) or "file"
+                if not os.path.splitext(filename)[1]:
+                    url_filename = os.path.basename(urlparse(url).path)
+                    url_extension = os.path.splitext(url_filename)[1]
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                    extension = url_extension or mimetypes.guess_extension(content_type or "") or ".bin"
+                    filename += extension
+                filepath = os.path.join("data", "cache", f"temp_{uuid.uuid4().hex}_{filename}")
                 
                 cl = response.content_length
                 if cl and cl > MAX_FILE_SIZE:
@@ -426,18 +450,14 @@ _donate_lock = asyncio.Lock()
 _donation_state = data_handler.load('donation_state') or {}
 
 
-def reminder_slot() -> str | None:
-    """Return the current twice-monthly reminder slot, if today is a reminder day."""
-    now = datetime.now(REPORT_TIMEZONE)
-    if now.day not in DONATE_REMINDER_DAYS:
-        return None
-    return now.strftime('%Y-%m-%d')
+def reminder_slot() -> str:
+    """Return the current monthly donation reminder slot."""
+    return datetime.now(REPORT_TIMEZONE).strftime('%Y-%m')
 
 
 def report_due(chat_id) -> bool:
-    """Return whether this chat has not received today's text reminder."""
-    slot = reminder_slot()
-    return slot is not None and _report_last_sent.get(str(chat_id)) != slot
+    """Return whether this destination has not received this month's reminder."""
+    return _report_last_sent.get(str(chat_id)) != reminder_slot()
 
 
 def mark_report_sent(chat_id) -> None:
@@ -491,27 +511,36 @@ def donation_report_text() -> str:
     return f"{DONATE_MESSAGE}\n{DONATE_URL}"
 
 
-async def send_report_to_tg(chat_id, thread_id=None) -> bool:
-    if not report_due(chat_id):
+async def send_report_to_tg(chat_id, thread_id=None, force=False) -> bool:
+    key = f"{chat_id}:{thread_id or 0}"
+    if not force and not report_due(key):
         return False
 
     async with _donate_lock:
-        if not report_due(chat_id):
+        if not force and not report_due(key):
             return False
-        text = donation_report_text()
         sent = await send_to_tg(
             lambda: bot.send_message(
                 chat_id,
-                text=text,
+                text=donation_report_text(),
                 message_thread_id=thread_id,
                 disable_notification=True,
             ),
-            "twice-monthly donation reminder",
+            "monthly donation reminder",
         )
         if sent:
-            mark_report_sent(chat_id)
+            mark_report_sent(key)
             return True
         return False
+
+
+async def send_donation_to_all() -> tuple[int, int]:
+    destinations = {(tg_id, thread_id) for tg_id, thread_id, _ in chat_pairs}
+    results = await asyncio.gather(*(
+        send_report_to_tg(chat_id, thread_id, force=True)
+        for chat_id, thread_id in destinations
+    ))
+    return sum(results), len(results)
 
 
 async def poll_donationalerts() -> None:
@@ -796,9 +825,16 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                     elif isinstance(attach, FileAttach):
                         file_info = await client.get_file_by_id(message.chat_id, message.id, attach.file_id)
                         if file_info and file_info.url:
-                            filename = getattr(file_info, 'name', 'file')
+                            filename = (
+                                getattr(file_info, 'name', None)
+                                or getattr(file_info, 'filename', None)
+                                or getattr(file_info, 'file_name', None)
+                                or 'file'
+                            )
                             filepath = await download_to_disk(file_info.url, filename)
                             if filepath:
+                                if not os.path.splitext(filename)[1]:
+                                    filename += os.path.splitext(filepath)[1]
                                 sent = await bot.send_document(
                                     tg_chat_id,
                                     document=FSInputFile(filepath, filename=filename),
@@ -851,6 +887,9 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
             if FLUSH_COUNTER % FLUSH_INTERVAL == 0:
                 data_handler.save('msgs', msgs_map)
                 l.info(f"Flushed msgs_map to disk ({len(msgs_map)} entries)")
+
+        if main_content_sent:
+            await send_report_to_tg(tg_chat_id, thread_id)
 
         return first_tg_id
 
