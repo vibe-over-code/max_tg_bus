@@ -20,6 +20,8 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import BufferedInputFile, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 import pymax
@@ -159,6 +161,10 @@ else:
     proxy_session = AiohttpSession()
 bot = None  # Will be created in main()
 dp = Dispatcher()
+
+class AnnouncementFlow(StatesGroup):
+    waiting_text = State()
+
 tg_send_semaphore = asyncio.Semaphore(TG_SEND_CONCURRENCY)
 restart_event = asyncio.Event()
 _last_max_error_notification = 0.0
@@ -222,7 +228,7 @@ def server_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="🔄 Перезапустить сервис", callback_data="server_restart"),
         ],
         [InlineKeyboardButton(text="♻️ Перезапустить MAX", callback_data="max_restart")],
-        [InlineKeyboardButton(text="📣 Отправить напоминание о донате во все чаты", callback_data="donation_send_all")],
+        [InlineKeyboardButton(text="📣 Создать анонс", callback_data="announcement_new")],
     ])
 
 
@@ -300,16 +306,57 @@ async def server_callback(query: CallbackQuery):
         await query.message.edit_text(text[:4096], reply_markup=server_keyboard())
 
 
-@dp.callback_query(lambda query: query.data == 'donation_send_all')
-async def donation_send_all_callback(query: CallbackQuery):
+@dp.callback_query(lambda query: query.data == 'announcement_new')
+async def announcement_new_callback(query: CallbackQuery, state: FSMContext):
     if not is_admin_user(query.from_user):
         await query.answer('Недостаточно прав', show_alert=True)
         return
 
-    await query.answer('Отправляю во все чаты...')
-    sent, total = await send_donation_to_all()
+    await state.set_state(AnnouncementFlow.waiting_text)
+    await query.answer()
     if query.message:
-        await query.message.answer(f'Напоминание о донате отправлено: {sent}/{total} чатов.')
+        await query.message.answer('Напиши текст анонса одним сообщением. Для отмены отправь /cancel.')
+
+
+@dp.message(AnnouncementFlow.waiting_text)
+async def announcement_text_handler(message: types.Message, state: FSMContext):
+    if not is_admin_user(message.from_user):
+        await state.clear()
+        return
+    text = (message.text or message.caption or '').strip()
+    if not text:
+        await message.answer('Нужен текст анонса. Отправь его сообщением или /cancel для отмены.')
+        return
+    await state.update_data(announcement_text=text)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='🔔 С уведомлением', callback_data='announcement_notify'),
+        InlineKeyboardButton(text='🔕 Без уведомления', callback_data='announcement_silent'),
+    ]])
+    await message.answer(f'Анонс для всех чатов:\n\n{text}\n\nВыбери режим отправки:', reply_markup=keyboard)
+
+
+@dp.message(Command('cancel'), AnnouncementFlow.waiting_text)
+async def announcement_cancel_handler(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer('Создание анонса отменено.')
+
+
+@dp.callback_query(lambda query: query.data in {'announcement_notify', 'announcement_silent'})
+async def announcement_send_callback(query: CallbackQuery, state: FSMContext):
+    if not is_admin_user(query.from_user):
+        await query.answer('Недостаточно прав', show_alert=True)
+        return
+    data = await state.get_data()
+    text = data.get('announcement_text')
+    if not text:
+        await state.clear()
+        await query.answer('Текст анонса потерян, начни заново.', show_alert=True)
+        return
+    await query.answer('Отправляю анонс...')
+    sent, total = await send_announcement_to_all(text, silent=query.data == 'announcement_silent')
+    await state.clear()
+    if query.message:
+        await query.message.answer(f'Анонс отправлен: {sent}/{total} чатов.')
 
 
 class MaxErrorTelegramHandler(Handler):
@@ -442,29 +489,6 @@ def split_text(text: str, limit: int = TG_TEXT_LIMIT) -> list[str]:
     return [text[i:i + limit] for i in range(0, len(text), limit)] or []
 
 
-_report_last_sent = {
-    str(chat_id): float(timestamp)
-    for chat_id, timestamp in (data_handler.load('report_last_sent') or {}).items()
-}
-_donate_lock = asyncio.Lock()
-_donation_state = data_handler.load('donation_state') or {}
-
-
-def reminder_slot() -> str:
-    """Return the current monthly donation reminder slot."""
-    return datetime.now(REPORT_TIMEZONE).strftime('%Y-%m')
-
-
-def report_due(chat_id) -> bool:
-    """Return whether this destination has not received this month's reminder."""
-    return _report_last_sent.get(str(chat_id)) != reminder_slot()
-
-
-def mark_report_sent(chat_id) -> None:
-    _report_last_sent[str(chat_id)] = reminder_slot()
-    data_handler.save('report_last_sent', _report_last_sent)
-
-
 async def send_to_tg(operation, description: str):
     """Retry temporary Telegram failures instead of dropping the message."""
     for attempt in range(1, TG_SEND_RETRIES + 1):
@@ -483,147 +507,19 @@ async def send_to_tg(operation, description: str):
             await asyncio.sleep(delay)
 
 
-def donation_month() -> str:
-    return datetime.now(REPORT_TIMEZONE).strftime('%Y-%m')
-
-
-def progress_bar(value: float, goal: float, width: int = 10) -> str:
-    ratio = min(max(value / goal if goal else 0, 0), 1)
-    filled = round(ratio * width)
-    return '█' * filled + '░' * (width - filled)
-
-
-def donation_report_text() -> str:
-    total = float(_donation_state.get('amount', 0.0))
-    server_amount = min(total, SERVER_GOAL)
-    cookies_amount = min(max(total - SERVER_GOAL, 0.0), COOKIES_GOAL)
-    return (
-        f"ℹ️ Поддержать проект: {DONATE_URL}\n\n"
-        f"На сервер  {progress_bar(server_amount, SERVER_GOAL)} "
-        f"{server_amount:.0f}/{SERVER_GOAL:.0f} {DONATION_CURRENCY}\n"
-        f"На печеньки {progress_bar(cookies_amount, COOKIES_GOAL)} "
-        f"{cookies_amount:.0f}/{COOKIES_GOAL:.0f} {DONATION_CURRENCY}"
-    )
-
-
-# DonationAlerts integration is intentionally disabled. The reminder is plain text only.
-def donation_report_text() -> str:
-    return f"{DONATE_MESSAGE}\n{DONATE_URL}"
-
-
-async def send_report_to_tg(chat_id, thread_id=None, force=False) -> bool:
-    key = f"{chat_id}:{thread_id or 0}"
-    if not force and not report_due(key):
-        return False
-
-    async with _donate_lock:
-        if not force and not report_due(key):
-            return False
-        sent = await send_to_tg(
-            lambda: bot.send_message(
-                chat_id,
-                text=donation_report_text(),
-                message_thread_id=thread_id,
-                disable_notification=True,
-            ),
-            "monthly donation reminder",
-        )
-        if sent:
-            mark_report_sent(key)
-            return True
-        return False
-
-
-async def send_donation_to_all() -> tuple[int, int]:
+async def send_announcement_to_all(text: str, silent: bool) -> tuple[int, int]:
     destinations = {(tg_id, thread_id) for tg_id, thread_id, _ in chat_pairs}
     results = await asyncio.gather(*(
-        send_report_to_tg(chat_id, thread_id, force=True)
+        send_to_tg(
+            lambda chat_id=chat_id, thread_id=thread_id: bot.send_message(
+                chat_id, text=text, message_thread_id=thread_id,
+                disable_notification=silent,
+            ),
+            "announcement",
+        )
         for chat_id, thread_id in destinations
     ))
-    return sum(results), len(results)
-
-
-async def poll_donationalerts() -> None:
-    """Collect confirmed DonationAlerts donations without sending per-donation messages."""
-    if not DONATIONALERTS_TOKEN:
-        l.info("DonationAlerts is disabled: DONATIONALERTS_ACCESS_TOKEN is not set")
-        return
-
-    headers = {"Authorization": f"Bearer {DONATIONALERTS_TOKEN}"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        while True:
-            try:
-                current_month = donation_month()
-                if _donation_state.get('month') != current_month:
-                    _donation_state.clear()
-                    _donation_state.update({
-                        'month': current_month,
-                        'amount': 0.0,
-                        'seen_ids': [],
-                    })
-                    data_handler.save('donation_state', _donation_state)
-                    l.info(f"Donation progress reset for {current_month}")
-
-                seen_ids = {str(item) for item in _donation_state.get('seen_ids', [])}
-                page = 1
-                added = 0
-                while page <= 20:
-                    async with session.get(
-                        DONATIONALERTS_API_URL,
-                        params={'page': page},
-                        timeout=REQUESTS_TIMEOUT,
-                    ) as response:
-                        response.raise_for_status()
-                        payload = await response.json()
-
-                    donations = payload.get('data', [])
-                    if not donations:
-                        break
-
-                    for donation in donations:
-                        donation_id = str(donation.get('id', ''))
-                        if not donation_id or donation_id in seen_ids:
-                            continue
-                        seen_ids.add(donation_id)
-
-                        if str(donation.get('created_at', ''))[:7] != current_month:
-                            continue
-                        if str(donation.get('currency', '')).upper() != DONATION_CURRENCY:
-                            l.warning(
-                                "Skipping DonationAlerts donation %s: currency %s, expected %s",
-                                donation_id,
-                                donation.get('currency'),
-                                DONATION_CURRENCY,
-                            )
-                            continue
-
-                        amount = float(donation.get('amount', 0) or 0)
-                        if amount > 0:
-                            _donation_state['amount'] = float(_donation_state.get('amount', 0)) + amount
-                            added += 1
-
-                    links = payload.get('links') or {}
-                    if not links.get('next'):
-                        break
-                    page += 1
-
-                _donation_state['seen_ids'] = list(seen_ids)[-10000:]
-                if added:
-                    data_handler.save('donation_state', _donation_state)
-                    l.info(
-                        "Donation progress updated: +%s %s, total=%s %s",
-                        added,
-                        DONATION_CURRENCY,
-                        _donation_state['amount'],
-                        DONATION_CURRENCY,
-                    )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                l.error(f"DonationAlerts polling failed: {e}")
-
-            await asyncio.sleep(DONATIONALERTS_POLL_SECONDS)
-
+    return sum(result is not None for result in results), len(results)
 
 async def download_content(url: str, expected_filename: str = "file") -> bytes | None:
     """Download content from URL into memory with size limit check."""
@@ -888,9 +784,6 @@ async def process_max_message(message: Message, forwarded: bool = False) -> int 
                 data_handler.save('msgs', msgs_map)
                 l.info(f"Flushed msgs_map to disk ({len(msgs_map)} entries)")
 
-        if main_content_sent:
-            await send_report_to_tg(tg_chat_id, thread_id)
-
         return first_tg_id
 
     except Exception as e:
@@ -1079,16 +972,6 @@ async def main():
     tg_task = create_task(safe_polling())
     tg_task.add_done_callback(_log_tg_error)
 
-    donation_task = None
-    if DONATIONALERTS_TOKEN:
-        donation_task = create_task(poll_donationalerts())
-
-        def _log_donation_error(t):
-            if not t.cancelled() and t.exception():
-                l.error(f"DonationAlerts polling crashed: {t.exception()}", exc_info=t.exception())
-
-        donation_task.add_done_callback(_log_donation_error)
-
     l.info("All tasks created, entering main loop...")
 
     try:
@@ -1101,8 +984,6 @@ async def main():
             if loop_count % 10 == 0:
                 l.info(f"Main loop running... (stop_event={stop_event.is_set()}, tg_task.done()={tg_task.done()}, max_task.done()={max_task.done()}, stop_task.done()={stop_task.done()})")
             wait_tasks = [tg_task, max_task, stop_task, restart_task]
-            if donation_task:
-                wait_tasks.append(donation_task)
             done, pending = await wait(
                 wait_tasks,
                 return_when=FIRST_COMPLETED
@@ -1142,10 +1023,6 @@ async def main():
                     else:
                         l.info("Telegram polling exited normally")
                         return
-                elif task == donation_task:
-                    l.error("DonationAlerts polling stopped")
-                    donation_task = create_task(poll_donationalerts())
-                    donation_task.add_done_callback(_log_donation_error)
 
     except Exception as e:
         l.error(f"Critical error in main loop: {e}", exc_info=True)
@@ -1158,8 +1035,6 @@ async def main():
         tg_task.cancel()
         max_task.cancel()
         restart_task.cancel()
-        if donation_task:
-            donation_task.cancel()
 
         await client.close()
         if bot:
